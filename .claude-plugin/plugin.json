@@ -1,0 +1,27 @@
+{
+  "name": "sqlserver",
+  "description": "Dedicated Microsoft SQL Server expert plugin covering the full scope of database management — operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud offerings, and security/authentication — across versions 2016-2025 and the Azure SQL / AWS RDS cloud families.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Christopher Huffman",
+    "email": "chrishuffman85@gmail.com"
+  },
+  "homepage": "https://github.com/chrishuffman5/sqlserver",
+  "repository": "https://github.com/chrishuffman5/sqlserver",
+  "license": "MIT",
+  "keywords": [
+    "sql-server",
+    "mssql",
+    "t-sql",
+    "dba",
+    "database-administration",
+    "always-on",
+    "availability-groups",
+    "high-availability",
+    "monitoring",
+    "performance-tuning",
+    "azure-sql",
+    "security",
+    "backup-recovery"
+  ]
+}

@@ -1,0 +1,17 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local Claude state
+.claude/
+.in_use/
+
+# SQL tooling output
+*.xel
+*.trc
+*.bak
+*.trn
