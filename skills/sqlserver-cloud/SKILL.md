@@ -24,11 +24,33 @@ Engine internals (storage engine, optimizer, T-SQL, indexing, AG mechanics) are 
 
 **Always pin down WHICH offering first.** Almost every answer changes based on it. If the user says "Azure SQL" ask whether they mean *Azure SQL Database* (PaaS single DB / elastic pool) or *Azure SQL Managed Instance* — these are different products with different feature sets, pricing, and connection models.
 
-1. **Identify the offering** — Azure SQL DB vs MI vs SQL-on-VM vs AWS RDS vs Cloud SQL. When diagnosing a live system, confirm with `SELECT SERVERPROPERTY('EngineEdition')`:
-   - `5` = Azure SQL Database (single/elastic pool)
-   - `8` = Azure SQL Managed Instance
-   - `3` = Enterprise/Developer box engine (SQL-on-VM, AWS RDS Enterprise, on-prem)
-   - `2` = Standard box engine; `4` = Express; `6` = Azure Synapse; `9` = Azure SQL Edge; `11` = Azure SQL DB Hyperscale (some surfaces still report 5)
+1. **Identify the offering** — Azure SQL DB vs MI vs SQL-on-VM vs AWS RDS vs Cloud SQL. When diagnosing a live system, confirm with the canonical detection query:
+
+   ```sql
+   -- Read-only diagnostic: platform / edition / Azure SQL DB tier detection
+   SELECT
+       SERVERPROPERTY('EngineEdition')                         AS engine_edition,   -- routing key (below)
+       SERVERPROPERTY('Edition')                               AS edition,
+       DATABASEPROPERTYEX(DB_NAME(), 'Edition')                AS db_edition,        -- 'Hyperscale' on HS
+       DATABASEPROPERTYEX(DB_NAME(), 'ServiceObjective')       AS service_objective; -- 'HS_*' on HS, 'GP_*','BC_*', etc.
+   ```
+
+   `EngineEdition` values (verify the current list on Microsoft Learn — [SERVERPROPERTY](https://learn.microsoft.com/en-us/sql/t-sql/functions/serverproperty-transact-sql)):
+
+   | EngineEdition | Offering |
+   |---|---|
+   | `1` | Personal/Desktop (legacy) |
+   | `2` | Standard box engine (SQL-on-VM, RDS/Cloud SQL Standard, on-prem) |
+   | `3` | Enterprise/Developer/Evaluation box engine (SQL-on-VM, AWS RDS Enterprise, on-prem) |
+   | `4` | Express box engine |
+   | `5` | **Azure SQL Database** — single DB / elastic pool, **including Hyperscale** |
+   | `6` | Azure Synapse Analytics (dedicated SQL pool) |
+   | `8` | **Azure SQL Managed Instance** |
+   | `9` | Azure SQL Edge |
+   | `11` | Azure Synapse serverless SQL pool |
+   | `12` | Microsoft Fabric SQL database |
+
+   **Hyperscale does NOT have its own EngineEdition** — it reports `5` (Azure SQL Database). Differentiate Hyperscale via `DATABASEPROPERTYEX(DB_NAME(),'Edition') = 'Hyperscale'` or `service_objective LIKE 'HS\_%'`. Microsoft Fabric SQL Database shares the Azure SQL Database engine but reports its **own** `EngineEdition = 12` per current Microsoft Learn (Microsoft's guidance here has shifted over time — verify for your build).
 2. **Identify the intent** — provisioning/sizing, HA/DR design, feature-gap troubleshooting, cost optimization, or migration. Migration is the heaviest sub-domain → read `references/cloud-migration.md`.
 3. **Load the offering's reference** for depth (see Reference Files below).
 4. **Reason in cloud terms** — the SLA, the HA model, who patches, what DMVs exist, and the cost levers are all offering-specific. Never give on-prem advice (e.g. "set max server memory", "add tempdb files", "configure WSFC quorum") for a PaaS offering where it does not apply.
@@ -43,7 +65,7 @@ Engine internals (storage engine, optimizer, T-SQL, indexing, AG mechanics) are 
 | SQL Server Agent | **No** (use Elastic Jobs) | **Yes** | Yes | Yes (SQL Agent jobs work; some job types restricted) |
 | Cross-database queries | **No** (use Elastic Query / external tables) | **Yes** (within the instance) | Yes | Yes (within the instance) |
 | Instance-level objects | No (logical `master`, no linked servers*) | Yes (linked servers, CLR, Service Broker within instance) | Yes | Limited (linked servers via option group; no Service Broker cross-instance) |
-| Max data size | 4 TB (GP/BC vCore) / 100 TB (Hyperscale) | 16 TB (BC) / up to 16 TB GP; larger w/ next-gen | VM disk limits (tens of TB, up to PB w/ pools) | 16 TB per instance |
+| Max data size | 4 TB (GP/BC vCore) / 128 TB (Hyperscale)* | Scales with vCores/hardware: GP up to 16 TB (32 TB next-gen); BC up to 16 TB (premium-series, enough vCores)* | VM disk limits (tens of TB, up to PB w/ pools) | 16 TB per instance |
 | HA model | Built-in; zone-redundant; geo-replication / failover groups | Built-in (GP = remote storage + Azure SR; BC = AG-like); failover groups | You build it: AG/FCI + Cloud Witness / Azure shared disks / S2D | Multi-AZ (synchronous, mirroring/AG under the hood) |
 | Patching | Microsoft (transparent) | Microsoft (transparent, maintenance windows) | You (or SQL IaaS Agent auto-patch) | AWS (maintenance windows) |
 | OS / `sa` access | None | None (but full T-SQL admin) | Full RDP / `sa` / root | No OS/RDP; limited admin login (no `sa`) |
@@ -52,6 +74,8 @@ Engine internals (storage engine, optimizer, T-SQL, indexing, AG mechanics) are 
 
 \* Azure SQL DB has no linked servers; the equivalent is Elastic Query / external data sources, which are far more limited.
 
+\* Max-size figures move (cloud limits change quarterly). Hyperscale single-DB max is currently **128 TB** (elastic-pool DBs lower); MI Business Critical reaches 16 TB only on premium-series hardware with sufficient vCores in supported regions (otherwise 5.5 TB), and on Standard-series caps at 4 TB. **Verify the current value on Microsoft Learn for your tier/region.**
+
 ## The Offerings in Brief
 
 ### Azure SQL Database (PaaS) — `EngineEdition = 5`
@@ -59,13 +83,13 @@ Database-as-a-service. You get a *logical server* (a connection endpoint and sec
 - **Purchasing models:** DTU (bundled compute+storage+IO, tiers Basic/Standard/Premium) or **vCore** (decoupled, recommended) with tiers **General Purpose**, **Business Critical**, and **Hyperscale**.
 - **Serverless** compute (GP/Hyperscale): auto-scales vCores within a range and **auto-pauses** when idle (billed for storage only) — great for intermittent workloads.
 - **Elastic pools** share a resource budget across many databases (ideal for SaaS multi-tenant where DBs peak at different times).
-- **Hyperscale** decouples compute from a distributed storage layer (page servers + log service) for databases up to **100 TB**, near-instant backups, fast restore, and multiple read replicas.
+- **Hyperscale** decouples compute from a distributed storage layer (page servers + log service) for databases up to **128 TB** (verify the current GA limit on Microsoft Learn — cloud limits change quarterly), near-instant backups, fast restore, and multiple read replicas.
 - **Gaps:** no SQL Agent (→ Elastic Jobs), no `USE`/cross-DB queries (→ Elastic Query), no instance objects, no FILESTREAM/Service Broker cross-DB, partial DMV surface, logical `master`.
 - Deep dive: `references/azure-sql-database.md`.
 
 ### Azure SQL Managed Instance (PaaS) — `EngineEdition = 8`
 A fully managed *instance* with near-100% on-prem surface area — the lift-and-shift target.
-- **Tiers:** General Purpose (remote storage), Business Critical (local SSD + built-in AG, includes a free readable secondary), and **Next-gen General Purpose** (improved scaling/IOPS).
+- **Tiers:** General Purpose (remote storage), Business Critical (local SSD + built-in AG, includes a free readable secondary), and **Next-gen General Purpose** (flexible storage scaling, separately provisioned IOPS, changed IO billing). Max storage scales with vCores and hardware generation (see `references/azure-managed-instance.md`) — not a flat number.
 - **Has** SQL Agent, cross-database queries, CLR, Service Broker (within the instance), linked servers, distributed transactions (within MI), global temp tables.
 - **vNet-injected** (private by default; optional public endpoint). **Auto-failover groups** for DR.
 - **MI link** (SQL Server 2022, and 2016+ as source via patches) gives near-real-time replication from on-prem SQL to MI for migration, read offload, and DR.
@@ -155,4 +179,6 @@ Read-only diagnostics. Each carries a standard header, sets `SET NOCOUNT ON;`, a
 - `scripts/02-managed-instance-checks.sql` — **Azure SQL Managed Instance** (EngineEdition 8). Instance resource stats (`sys.server_resource_stats`), vCores/tier, reserved vs used storage, tempdb config, Agent job status pointer, recent backups, errorlog access.
 - `scripts/03-geo-replication-status.sql` — **Azure SQL DB / MI**. Geo-replication link status & lag (`sys.dm_geo_replication_link_status`, `sys.geo_replication_links`) and failover-group readiness, with offering guards.
 - `scripts/04-iaas-cloud-readiness.sql` — **SQL on Azure VM / AWS RDS** (box engine, EngineEdition 2/3/4). Platform/edition confirmation, Instant File Initialization, data/log file latency vs cloud-disk suitability, tempdb config, AG/witness presence, max-memory sanity vs VM size — framed as cloud-IaaS hygiene.
-- `scripts/05-migration-readiness.sql` — **on-prem source** being assessed for the cloud. Compatibility level, deprecated-feature counters, Azure-SQL-DB-blocking features (cross-DB references, CLR, FILESTREAM, Service Broker, Agent jobs, linked servers, server logins), DB size/file count, non-default collation, and the instance-level object inventory to recreate at the target.
+- `scripts/05-migration-readiness.sql` — **on-prem source** being assessed for the cloud. Compatibility level, deprecated-feature counters, Azure-SQL-DB-blocking features (cross-DB references, CLR, FILESTREAM, Service Broker, Agent jobs, linked servers, server logins), DB size/file count, non-default collation, and the instance-level object inventory to recreate at the target. **Run Sections 3a–3d in EACH database** (they assess the current DB only); Sections 1/2/4/5/6 are server-wide.
+
+For continuous baselining/trending against cloud targets (Erik Darling **PerformanceMonitor** supports MI and AWS RDS; Azure SQL Database via its Lite edition) and ad-hoc point-in-time triage with the Brent Ozar First Responder Kit, see the community-tools guidance in `sqlserver-monitoring` — review before running, consistent with the bundled-script policy.

@@ -9,6 +9,11 @@
  *           and linked servers do not exist on Azure SQL Database.
  * Safety  : READ-ONLY. No sp_configure / RECONFIGURE is executed - remediation
  *           appears only as commented templates.
+ * Note    : Per-database sections use sys.sp_MSforeachdb, which is UNDOCUMENTED
+ *           and unsupported, can SILENTLY SKIP databases, and is UNAVAILABLE on
+ *           Azure SQL Database. For production estates, prefer a supported
+ *           explicit cursor over sys.databases (state_desc = 'ONLINE') to
+ *           guarantee every database is covered.
  *
  * Sections:
  *   1. Dangerous sys.configurations Options

@@ -20,6 +20,7 @@ When a domain (or local Windows) account connects with `Integrated Security=SSPI
 Logins of this kind are stored in `sys.server_principals` as type `U` (Windows user) or `G` (Windows group). **Prefer mapping logins to AD groups, not individual users** — membership is then managed in AD and survives staff changes.
 
 ```sql
+-- [SECURITY CHANGE] illustrative; use placeholder principals, confirm the target instance.
 CREATE LOGIN [CONTOSO\jsmith]          FROM WINDOWS;          -- individual user
 CREATE LOGIN [CONTOSO\SQL-DBAs]        FROM WINDOWS;          -- AD group (preferred)
 CREATE LOGIN [BUILTIN\Administrators]  FROM WINDOWS;          -- local group (avoid in prod)
@@ -99,15 +100,28 @@ Prerequisites for any KCD: valid SPNs on both the middle-tier service and SQL Se
 A **SQL login** stores a name and a salted-hashed password in `master` (type `S` in `sys.server_principals`). Required when AD is unavailable (workgroup servers, many Linux deployments, cross-org apps). It must be enabled at the instance level (Mixed Mode).
 
 ```sql
+-- [SECURITY CHANGE] illustrative; use placeholder names, confirm the target instance.
+-- (a) HUMAN / interactive login: enforce policy AND expiration.
+CREATE LOGIN [a_person]
+WITH PASSWORD = N'<generate-32+char-random-secret>',
+     CHECK_POLICY = ON,        -- enforce host password complexity + lockout
+     CHECK_EXPIRATION = ON,    -- enforce max-age expiry (humans can rotate interactively)
+     DEFAULT_DATABASE = [AppDB];
+
+-- (b) SERVICE / application login: enforce policy, but expiration OFF (no interactive rotation)
+--     -> rotate the secret OUT OF BAND on a schedule. Prefer Windows/Entra/managed identity
+--        for services where the platform allows it.
 CREATE LOGIN [reporting_app]
-WITH PASSWORD = N'<long-random-secret>',
-     CHECK_POLICY = ON,        -- enforce Windows password complexity + lockout
-     CHECK_EXPIRATION = ON,    -- enforce max-age expiry (turn OFF for service accounts)
+WITH PASSWORD = N'<generate-32+char-random-secret>',
+     CHECK_POLICY = ON,
+     CHECK_EXPIRATION = OFF,
      DEFAULT_DATABASE = [ReportDB];
+-- Source secrets from a secret manager; never commit them; avoid T-SQL/shell history exposure;
+-- rotate any value ever pasted from documentation.
 ```
 
-- **`CHECK_POLICY`** ties the password to the host Windows password policy (complexity, history, lockout threshold). **Keep ON.** On Linux there is no Windows policy engine, so `CHECK_POLICY` enforces a built-in minimum but not full domain policy.
-- **`CHECK_EXPIRATION`** enforces maximum password age. Useful for human accounts; usually **OFF for service/application accounts** that cannot rotate interactively — but then rotate them out of band.
+- **`CHECK_POLICY`** ties the password to the host **Windows** password policy (complexity, history, lockout threshold) via the OS. **Keep ON.** On **Linux** there is no Windows policy engine, so complexity enforcement is **limited and version-dependent** — recent builds enforce a basic built-in minimum (length/complexity) but not full domain policy, and historically `CHECK_POLICY` enforcement on Linux was partial. Don't assume Windows-equivalent policy on Linux; supplement with external controls.
+- **`CHECK_EXPIRATION`** enforces maximum password age. Useful for **human** accounts that can rotate interactively; usually **OFF for service/application accounts** — but then **rotate them out of band** on a schedule.
 - Passwords are stored as a salted hash (`sys.sql_logins.password_hash`); the algorithm strengthened over versions (SHA-512 since 2012). Never reversible.
 - The login handshake is always encrypted by SQL Server even without a configured certificate, but **force TLS for the whole session** (see `encryption.md`) so the rest of the traffic is protected too.
 
@@ -129,11 +143,12 @@ WHERE (is_policy_checked = 0 OR is_expiration_checked = 0) AND is_disabled = 0;
 
 ## 3. Microsoft Entra ID (Azure AD) Authentication
 
-For **Azure SQL Database** and **Managed Instance** (and Arc-enabled box product), **Microsoft Entra ID** is the cloud replacement for Windows/AD. It supports MFA, conditional access, and **managed identities** (no secrets to store). Principals are created `FROM EXTERNAL PROVIDER` and appear as type `E` (Entra user/service principal) or `X` (Entra group) in `sys.database_principals` / `sys.server_principals` (MI).
+For **Azure SQL Database** and **Managed Instance** (and Arc-enabled box product), **Microsoft Entra ID** is the cloud replacement for Windows/AD. It supports MFA, conditional access, and **managed identities** (no secrets to store). Principals are created `FROM EXTERNAL PROVIDER` and carry type `E` (external user/login) or `X` (external group). The exact `type_desc` differs by catalog view and platform: in **`sys.database_principals`** (contained users — Azure SQL DB and MI) `E` = `EXTERNAL_USER` and `X` = `EXTERNAL_GROUPS`; in **`sys.server_principals`** (server logins — MI, and in preview for Azure SQL DB) `E` = `EXTERNAL_LOGIN` and `X` = `EXTERNAL_GROUP`. (`authentication_type_desc = 'EXTERNAL'` marks Entra authentication.) Verify the strings for your platform on Microsoft Learn.
 
 Each logical server / MI has exactly **one Entra administrator** (a user or group) set on the Azure side; that admin then creates contained Entra users in databases.
 
 ```sql
+-- [SECURITY CHANGE] illustrative; use placeholder identities, confirm the target DB via DB_NAME().
 -- Azure SQL DB: create contained users mapped to Entra identities (run in the user DB)
 CREATE USER [alice@contoso.com]              FROM EXTERNAL PROVIDER;  -- Entra user
 CREATE USER [SQL-App-Writers]                FROM EXTERNAL PROVIDER;  -- Entra group
@@ -153,6 +168,11 @@ ALTER ROLE db_datareader ADD MEMBER [SQL-App-Writers];
 
 Connection-string hints: `Authentication=Active Directory Integrated|Password|Interactive|Managed Identity|Service Principal`. Managed identity and service principal are the right choices for unattended app-to-DB auth — they avoid embedding SQL passwords.
 
+**Managed identity guidance (preferred for Azure-hosted apps):**
+- **System-assigned** identity is tied to the lifecycle of one Azure resource (deleted with it) — simplest for a single app. **User-assigned** identity is a standalone resource you can share across several apps/resources and manage centrally — better for fleets and blue/green deployments. Create the DB user `FROM EXTERNAL PROVIDER` against the identity's name (system-assigned uses the resource name; user-assigned uses the identity's name and you must specify its client ID when there are multiple).
+- Modern drivers expose **`Authentication=Active Directory Default`** (the "DefaultAzureCredential" chain), which transparently tries managed identity, then Azure CLI / environment / interactive — letting the same code run unchanged from a dev box and in Azure. Prefer it over hard-wiring `Managed Identity` where portability matters.
+- Entra **tokens are cached** by the driver and are short-lived (typically ~1 hour) and auto-refreshed; design retry/connection logic to tolerate a refresh, and don't cache a token longer than its lifetime. Azure-side specifics are in `sqlserver-cloud`.
+
 ### 3.2 Entra-only authentication enforcement
 
 You can **disable SQL authentication entirely** so only Entra principals connect — eliminating password-based logins and their rotation burden. Set on the Azure side (Azure portal / CLI / ARM) per server or MI; once enabled, `CREATE LOGIN ... WITH PASSWORD` and connecting as `sa`/SQL logins are blocked. This is a strong hardening control for cloud estates. See `sqlserver-cloud` for the Azure-side configuration.
@@ -167,6 +187,7 @@ These authenticate by **possession of a private key**, not a password — and ar
 2. **Module signing** — sign a stored procedure/function with a certificate, create a login/user *from that certificate*, and grant **that** principal the elevated permission. The module then runs with the certificate's rights **without** granting them to callers and **without** the ownership-chaining / `EXECUTE AS` pitfalls. (Full pattern in `authorization-rbac.md`.)
 
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm the target instance, back up any certificate + private key on creation.
 -- Certificate-mapped login (e.g., for an endpoint or signed module), type 'C'
 CREATE CERTIFICATE [EndpointCert] WITH SUBJECT = 'AG endpoint auth';
 CREATE LOGIN [EndpointLogin] FROM CERTIFICATE [EndpointCert];
@@ -184,14 +205,15 @@ A **contained database** authenticates users **inside the user database** with n
 Enable at the instance, then at the database:
 
 ```sql
+-- [CONFIG CHANGE] + [SECURITY CHANGE] templates; confirm the target instance/DB before running.
 -- Instance: allow contained databases (run once)
 -- EXEC sp_configure 'contained database authentication', 1; RECONFIGURE;
 
 -- Database: make it partially contained
--- ALTER DATABASE [SalesDB] SET CONTAINMENT = PARTIAL;
+-- ALTER DATABASE [MyDB] SET CONTAINMENT = PARTIAL;
 
 -- Contained user with its own password (no login in master)
--- CREATE USER [contained_app] WITH PASSWORD = N'<secret>';
+-- CREATE USER [contained_app] WITH PASSWORD = N'<generate-32+char-random-secret>';  -- source from a secret manager
 -- Contained Windows user
 -- CREATE USER [CONTOSO\svc] ;   -- maps to Windows identity, still no server login
 ```
@@ -203,6 +225,19 @@ Key behaviors and **security considerations**:
 - A `db_owner` of a contained DB can create users with passwords that connect to the *instance* — so granting `db_owner` on a contained DB is closer to granting server access than usual. **Limit `db_owner` and `ALTER ANY USER`** on contained DBs.
 - Password-policy enforcement for contained SQL users is weaker than instance logins; rely on the host policy where possible.
 - Connecting to a contained DB can be used to enumerate other databases on the instance in some configurations — review the threat model before enabling broadly.
+
+### 5.1 Orphaned users & the login-reconciliation playbook (AG / restore / migration)
+
+A database user mapped to a **SQL login by SID** breaks when the database moves to an instance where that login is absent or has a different SID — the classic **orphaned user** (detected in `scripts/01-security-audit.sql`). Windows/Entra users orphan when the underlying AD/Entra identity changes. This bites after a restore to a new server, an AG failover to a replica missing the login, or a migration. The playbook:
+
+1. **Pre-stage logins on every target/replica before they're needed.** Script the source logins with their **SIDs and hashed passwords** so the recreated SQL login keeps the same SID and password (use `sp_help_revlogin` / a scripted `CREATE LOGIN ... WITH PASSWORD = 0x... HASHED, SID = 0x...`). Matching SIDs means the existing DB users map automatically — no remap needed. Keep this in source control and run it as part of AG seeding and DR runbooks.
+2. **Remap an already-orphaned user** to the correct login:
+   ```sql
+   -- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), use placeholder names.
+   ALTER USER [app_user] WITH LOGIN = [app_user];   -- re-point a user to its (same-named) login
+   ```
+   `ALTER USER ... WITH LOGIN` is the supported remap. The old `sp_change_users_login` is **deprecated** — don't use it for new work.
+3. **Or avoid the problem entirely** with **contained databases** (§5), whose users travel with the DB and never orphan on failover.
 
 ---
 
@@ -217,7 +252,7 @@ A failed login returns generic **error 18456** to the client (to avoid leaking d
 | **7** | Login disabled **and** password mismatch |
 | **8** | Password mismatch (correct user, wrong password) |
 | **9** | Password is not valid (e.g., expired-style condition) |
-| **11 / 12** | Login valid but **server access denied** — usually permission/role/SPN/Kerberos issue (12 = also at connect time) |
+| **11 / 12** | Login is **valid but denied server access** — typically a valid login that can't get in: UAC token filtering for a local Windows admin (the elevated token isn't presented), a `DENY CONNECT`/disabled login, or missing `CONNECT SQL`. Not primarily an SPN/Kerberos symptom (cross-check `auth_scheme` only to rule those out). 12 = the same, evaluated at connection time |
 | **13** | SQL Server service is paused |
 | **18** | Password **expired** / must be changed (`CHECK_EXPIRATION`) |
 | **38 / 40** | Login valid but the **default/target database** is unavailable or login lacks access to it |
@@ -230,7 +265,7 @@ A failed login returns generic **error 18456** to the client (to avoid leaking d
 -- EXEC xp_readerrorlog 0, 1, N'Login failed', NULL, NULL, NULL, N'desc';
 ```
 
-The most common real-world states: **8** (wrong password), **38** (no access to default DB), **58** (SQL login but server is Windows-only), and **11/12** (Kerberos/SPN or access-denied — cross-check `auth_scheme`).
+The most common real-world states: **8** (wrong password), **38** (no access to default DB), **58** (SQL login but server is Windows-only), and **11/12** (valid login denied server access — most often UAC token filtering for a local admin, a denied/disabled login, or missing `CONNECT SQL`; cross-check `auth_scheme` only to rule out a Kerberos/SPN edge case).
 
 ---
 
@@ -245,8 +280,8 @@ Every server principal carries a one-letter `type` (and matching `type_desc`):
 | `G` | WINDOWS_GROUP | Windows/AD **group** login |
 | `C` | CERTIFICATE_MAPPED_LOGIN | Login mapped to a certificate (endpoints / module signing) |
 | `K` | ASYMMETRIC_KEY_MAPPED_LOGIN | Login mapped to an asymmetric key |
-| `E` | EXTERNAL_LOGIN_FROM_AAD | Microsoft Entra ID user or service principal (Azure SQL / MI) |
-| `X` | EXTERNAL_GROUPS_FROM_AAD | Microsoft Entra ID **group** (Azure SQL / MI) |
+| `E` | EXTERNAL_LOGIN | Microsoft Entra ID user/login or service principal (MI; in preview for Azure SQL DB at server scope) |
+| `X` | EXTERNAL_GROUP | Microsoft Entra ID **group** (MI; in preview for Azure SQL DB at server scope) |
 | `R` | SERVER_ROLE | Fixed or user-defined **server role** (a principal, not a login) |
 
 ```sql
@@ -256,7 +291,7 @@ WHERE type IN ('S','U','G','C','K','E','X')
 ORDER BY type, name;
 ```
 
-(Database-level principals in `sys.database_principals` add `SQL_USER` `S`, `WINDOWS_USER` `U`, `WINDOWS_GROUP` `G`, `DATABASE_ROLE` `R`, `APPLICATION_ROLE` `A`, `EXTERNAL_USER` `E`/`X`, and `CERTIFICATE_MAPPED_USER` `C` — covered in `authorization-rbac.md`.)
+(Database-level principals in `sys.database_principals` add `SQL_USER` `S`, `WINDOWS_USER` `U`, `WINDOWS_GROUP` `G`, `DATABASE_ROLE` `R`, `APPLICATION_ROLE` `A`, `EXTERNAL_USER` `E`, `EXTERNAL_GROUPS` `X`, and `CERTIFICATE_MAPPED_USER` `C` — note the `type_desc` strings differ from the server-level view above; covered in `authorization-rbac.md`.)
 
 ---
 

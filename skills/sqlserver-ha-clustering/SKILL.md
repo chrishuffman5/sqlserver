@@ -43,7 +43,7 @@ Key distinctions:
 
 Full architecture, T-SQL, and troubleshooting in `references/availability-groups.md`. The essentials:
 
-- **Topology**: A WSFC (Windows) or Pacemaker (Linux, `CLUSTER_TYPE = EXTERNAL`) or no cluster at all (`CLUSTER_TYPE = NONE`, read-scale, 2017+) hosts an AG of up to **9 replicas** (1 primary + up to 8 secondaries; up to 3 can be **synchronous**). Each replica is a standalone instance (or an FCI) with its own copy of the availability databases. A **listener** (VNN + IP) provides a single connection point with read-only routing.
+- **Topology**: A WSFC (Windows) or Pacemaker (Linux, `CLUSTER_TYPE = EXTERNAL`) or no cluster at all (`CLUSTER_TYPE = NONE`, read-scale, 2017+) hosts an AG of up to **9 replicas** (1 primary + up to 8 secondaries, 2016+). Three distinct caps apply: **synchronous-commit** replicas — up to **3** on 2016/2017, raised to **5** (1 primary + 4 sync secondaries) on **2019+**; **automatic-failover targets** — up to **3** (1 primary + 2 sync secondaries) on 2016+, raised from 2 in 2012/2014. Each replica is a standalone instance (or an FCI) with its own copy of the availability databases. A **listener** (VNN + IP) provides a single connection point with read-only routing.
 - **Availability mode**: `SYNCHRONOUS_COMMIT` (primary waits for the secondary to harden the log → zero data loss, latency cost) vs `ASYNCHRONOUS_COMMIT` (fire-and-forget → RPO = current lag, for WAN/DR). `session_timeout` (default 10s) controls when an unresponsive replica is declared disconnected.
 - **Failover mode**: `AUTOMATIC` (requires sync-commit + the secondary SYNCHRONIZED) or `MANUAL`. `required_synchronized_secondaries_to_commit` (2017+) makes commits wait for *N* sync secondaries to be available, trading availability for guaranteed durability.
 - **Seeding**: `AUTOMATIC` (direct stream over the endpoint — no manual backup/restore, 2016+) or manual backup/restore (`seeding_mode = MANUAL`). Automatic seeding needs matching paths and `GRANT CREATE ANY DATABASE` on the secondary.
@@ -90,14 +90,17 @@ Full detail in `references/log-shipping-and-replication.md`. **Publisher → Dis
 
 Detailed runbook in `references/dr-planning.md`. Three shapes:
 
-- **Planned (manual) failover** — both sync replicas healthy; no data loss. AG: `ALTER AVAILABILITY GROUP [ag] FAILOVER;` (run on the *target* secondary).
+- **Planned (manual) failover** — both sync replicas healthy; no data loss. AG: `ALTER AVAILABILITY GROUP [MyAG] FAILOVER;` (run on the *target* secondary; `[CONFIG CHANGE]` role change).
 - **Unplanned automatic failover** — sync-commit + automatic mode + SYNCHRONIZED; WSFC/Pacemaker moves the role. Validate afterward.
-- **Forced failover with possible data loss** — async or unsynchronized replica; **explicitly accepts data loss**:
+- **Forced failover with possible data loss** — async or unsynchronized replica; **explicitly accepts data loss**. This is a **runbook TEMPLATE, not runnable SQL** — see the gated, pre-flight-checklisted version in `references/dr-planning.md` §5:
   ```sql
-  -- WARNING: may lose committed transactions. Last resort. Other replicas need resume/reseed afterward.
-  ALTER AVAILABILITY GROUP [ag] FORCE_FAILOVER_ALLOW_DATA_LOSS;
+  -- [DATA-LOSS RISK] Forced failover CAN LOSE COMMITTED TRANSACTIONS. Last resort. Template only.
+  -- PRE-FLIGHT (mandatory): verify the surviving replica's role/state; compare last_hardened_lsn
+  --   across replicas; obtain documented business approval for data loss; confirm current verified
+  --   backups; freeze/redirect the application; name the reconciliation/rollback owner.
+  -- ALTER AVAILABILITY GROUP [CONFIRM_AG_NAME] FORCE_FAILOVER_ALLOW_DATA_LOSS;
   ```
-  After a forced failover, the old primary (and other secondaries) must be **resumed** or **reseeded** to rejoin, and you must reconcile lost data.
+  After a forced failover, the old primary (and other secondaries) must be **resumed** or **reseeded** to rejoin, and you must reconcile lost data. Full runbook in `references/dr-planning.md`.
 
 Always: **detect → decide (consult RPO/RTO) → fail over → validate (app connectivity, sync state) → fail back when safe.**
 
@@ -106,6 +109,7 @@ Always: **detect → decide (consult RPO/RTO) → fail over → validate (app co
 - HA-specific health: use the scripts here (`scripts/01`–`07`) and the AG/cluster/mirroring/endpoint DMVs.
 - General alerting, waits (`HADR_SYNC_COMMIT`, `PARALLEL_REDO_*`, `DBMIRROR_*`), Query Store, and Extended Events live in **`sqlserver-monitoring`** — wire AG lag and sync-health alerts there.
 - Backups that feed log shipping / AG-secondary backups are an **`sqlserver-operations`** concern.
+- **Community tools** (read-only diagnostics, documented in `sqlserver-monitoring`): the **First Responder Kit** `sp_BlitzBackups` estimates RPO/RTO from `msdb` backup history — a useful cross-check against your AG/log-shipping RPO targets. See `sqlserver-monitoring` for install/usage and the broader sp_Blitz* / Erik Darling PerformanceMonitor coverage.
 
 ## Common Pitfalls
 

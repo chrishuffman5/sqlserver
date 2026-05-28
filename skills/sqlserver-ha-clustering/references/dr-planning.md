@@ -77,27 +77,45 @@ Keep a per-AG / per-system runbook. The universal shape:
 
 ### Planned / automatic AG failover (no data loss — replica SYNCHRONIZED)
 ```sql
--- Run on the TARGET secondary (which becomes primary). Sync + SYNCHRONIZED required.
-ALTER AVAILABILITY GROUP [AG1] FAILOVER;
+-- [CONFIG CHANGE] Role change, no data loss. Run on the TARGET secondary (which becomes primary).
+-- Sync + SYNCHRONIZED required. Confirm the AG name and that you are on the intended target replica.
+ALTER AVAILABILITY GROUP [MyAG] FAILOVER;
 ```
 
-### Forced AG failover (POSSIBLE DATA LOSS — async or not synchronized)
+### Forced AG failover (POSSIBLE DATA LOSS — async or not synchronized) — RUNBOOK TEMPLATE, NOT RUNNABLE
+This is a **[DATA-LOSS RISK]** operation. The block below is a **non-runnable template** — every executable line is commented and object names are confirm-placeholders. Complete the pre-flight checklist, then deliberately reconstruct the command for your environment.
+
+**Pre-flight checklist (mandatory):**
+1. Verify the surviving replica's **role and database state** (`sys.dm_hadr_availability_replica_states`, `sys.dm_hadr_database_replica_states`).
+2. Compare **`last_hardened_lsn`** / `synchronization_state_desc` across replicas to quantify what will be lost (this *is* your actual RPO at this moment).
+3. Obtain **documented business approval** for accepting data loss.
+4. Confirm **current, verified backups** exist (full + log chain restorable).
+5. **Freeze / redirect the application** so no new writes hit the doomed primary mid-failover.
+6. Name the **post-change reconciliation / rollback owner** before you proceed.
+
 ```sql
--- WARNING: may lose committed transactions. Last resort, used when the primary is gone
--- or the target is not synchronized. Run on the surviving secondary.
-ALTER AVAILABILITY GROUP [AG1] FORCE_FAILOVER_ALLOW_DATA_LOSS;
+-- [DATA-LOSS RISK] Forced AG failover CAN LOSE COMMITTED TRANSACTIONS. Last resort. TEMPLATE ONLY.
+-- Run on the surviving secondary, used when the primary is gone or the target is not synchronized.
+-- ALTER AVAILABILITY GROUP [CONFIRM_AG_NAME] FORCE_FAILOVER_ALLOW_DATA_LOSS;
 ```
 After a forced failover:
-- The new primary may be **missing transactions** that were committed but not hardened on it → reconcile/replay lost data from logs/backups if possible.
-- Other replicas (incl. the old primary, once back) will be in a **SUSPENDED / divergent** state and must be **resumed** (`ALTER DATABASE [db] SET HADR RESUME;`) or, if they diverged past the new primary's LSN, **removed and reseeded**.
+- The new primary may be **missing transactions** that were committed but not hardened on it → reconcile/replay lost data from logs/backups if possible (see §5a on backup-chain divergence).
+- Other replicas (incl. the old primary, once back) will be in a **SUSPENDED / divergent** state and must be **resumed** or, if they diverged past the new primary's LSN, **removed and reseeded**:
+  ```sql
+  -- [CONFIG CHANGE] Resume a suspended secondary after the topology is decided (no data loss by itself).
+  -- ALTER DATABASE [CONFIRM_DB] SET HADR RESUME;
+  ```
 - Re-evaluate `required_synchronized_secondaries_to_commit` so commits aren't blocked by the now-degraded topology.
 
 ### Mirroring
 ```sql
--- Planned (sync, no loss), on the principal:
-ALTER DATABASE [AppDB] SET PARTNER FAILOVER;
--- Forced (possible data loss), on the mirror:
-ALTER DATABASE [AppDB] SET PARTNER FORCE_SERVICE_ALLOW_DATA_LOSS;
+-- [CONFIG CHANGE] Planned mirroring failover (sync, no data loss) — run on the PRINCIPAL. Confirm DB name.
+ALTER DATABASE [MyAppDB] SET PARTNER FAILOVER;
+```
+Forced mirroring service is a **[DATA-LOSS RISK]** operation — **non-runnable template**, complete the pre-flight checklist above (verify partner state, approval, backups, app freeze, reconciliation owner) before reconstructing it:
+```sql
+-- [DATA-LOSS RISK] Forced service CAN LOSE COMMITTED TRANSACTIONS — run on the MIRROR when the principal is gone. TEMPLATE ONLY.
+-- ALTER DATABASE [CONFIRM_DB] SET PARTNER FORCE_SERVICE_ALLOW_DATA_LOSS;
 ```
 
 ### FCI
@@ -105,6 +123,14 @@ WSFC drives FCI failover (automatic on node/health failure). Manual move: use Fa
 
 ### Log shipping
 Manual: apply outstanding (and, if possible, tail-log) backups, then `RESTORE DATABASE [db] WITH RECOVERY;` and repoint apps (see `log-shipping-and-replication.md` §A6).
+
+## 5a. After a Forced Failover — Backup Chain & LSN Divergence
+
+A forced failover creates a **new recovery branch** on the new primary. Two things need deciding for every other replica:
+
+- **Resume vs reseed.** Compare each lagging replica's **`last_hardened_lsn`** (`sys.dm_hadr_database_replica_states`) against the new primary's. If a replica's hardened LSN is **at or behind** the new primary's recovery fork, `SET HADR RESUME` can re-link it (the engine reconciles from the common point). If it **diverged past** that point (it hardened transactions the new primary never had), it cannot simply resume — **remove it from the AG and reseed** (automatic seeding or restore-with-norecovery). Forcing resume on a diverged replica risks logical inconsistency.
+- **Re-establish a valid backup chain.** The forced failover may invalidate the differential/log chain that was anchored on the old primary. On the new primary, take a fresh **full backup** to anchor a new chain, then resume your log-backup cadence. Don't rely on the pre-failover backup chain to be restorable forward across the fork. Validate with `RESTORE VERIFYONLY` / a real test restore (see `sqlserver-operations`).
+- **Reconcile lost writes.** Anything committed on the old primary but never hardened on the new primary is lost from the database — recover it from application logs, the old primary's tail-of-log (if its storage survived), or upstream sources.
 
 ## 6. DR Testing Cadence
 
@@ -114,7 +140,7 @@ An untested DR plan is a hope, not a plan.
 - **Annually**: full DR drill — fail over to the **DR region**, run the application there, measure actual RPO/RTO, then fail back. Include the people/process (who decides, who executes, comms).
 - **On change**: re-test after topology, version, or network changes.
 - **Validate backups continuously**: restore-test backups (an AG/cluster does not remove the need for tested backups — see `sqlserver-operations`). Verify `RESTORE VERIFYONLY` and periodic real restores.
-- Record actual measured RPO/RTO vs objectives; close gaps.
+- Record actual measured RPO/RTO vs objectives; close gaps. The First Responder Kit **`sp_BlitzBackups`** (read-only; documented in `sqlserver-monitoring`) estimates achievable RPO/RTO from `msdb` backup history — a quick cross-check against your objectives.
 
 ## 7. Multi-Site, Cross-Region & Cloud DR
 
@@ -124,4 +150,5 @@ An untested DR plan is a hope, not a plan.
   - **Azure SQL Database / Managed Instance**: **auto-failover groups** (geo-replication + automatic listener redirection), **zone-redundant** configurations for in-region HA. The cloud platform manages quorum, witness, and failover — you do **not** build WSFC.
   - **SQL on Azure VM (IaaS)**: this skill's box-product techniques apply (AG/FCI on WSFC); the SQL IaaS extension and Azure Cloud Witness help.
   - **AWS RDS for SQL Server**: **Multi-AZ** uses mirroring/AG under the hood, managed by AWS — you don't run failover commands; AWS does.
+  - **Hybrid box→cloud DR**: the **Managed Instance link** (distributed-AG-based) replicates a box SQL Server to **Azure SQL Managed Instance** as a managed cloud DR replica / migration target — one-way from SQL Server 2016/2017/2019, and **two-way DR with failback on SQL Server 2022+**. A hybrid option when you want a cloud DR copy without building a second self-managed site. Detail lives in **`sqlserver-cloud`** (verify version/policy requirements on Microsoft Learn).
   - Do **not** duplicate cloud failover-group setup here — point the user to `sqlserver-cloud`.

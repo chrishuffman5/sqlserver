@@ -63,9 +63,11 @@ Inside the engine you still use `sp_configure` for everything else (MAXDOP, cost
 The official image is **`mcr.microsoft.com/mssql/server`** (tag by version, e.g., `:2022-latest`).
 
 ```bash
+# Source MSSQL_SA_PASSWORD from a secret manager / --env-file, NOT a literal in the command.
+# A literal lands in your shell history and the container's inspectable env. Generate a 32+ char random secret; never commit it; rotate any value ever copied from docs.
 docker run -d --name sql2022 \
   -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" \
+  -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" \
   -e "MSSQL_PID=Developer" \
   -p 1433:1433 \
   -v sqlvolume:/var/opt/mssql \
@@ -75,7 +77,7 @@ docker run -d --name sql2022 \
 | Env var | Required | Purpose |
 |---|---|---|
 | `ACCEPT_EULA` | **Yes** (`Y`) | Accept the license; the container will not start without it |
-| `MSSQL_SA_PASSWORD` | **Yes** | The `sa` password (note: older docs use `SA_PASSWORD`, now deprecated). Must meet strength policy |
+| `MSSQL_SA_PASSWORD` | **Yes** | The `sa` password (older docs use `SA_PASSWORD`, now deprecated). Must meet strength policy. **Never hard-code it** — inject from a secret manager or `--env-file` (`N'<generate-32+char-random-secret>'`), keep it out of shell history and image layers, and rotate any value copied from docs |
 | `MSSQL_PID` | recommended | Edition: `Developer` (default), `Express`, `Standard`, `Enterprise`, `EnterpriseCore`, or a product key |
 | `MSSQL_COLLATION`, `MSSQL_TCP_PORT`, `MSSQL_AGENT_ENABLED`, `MSSQL_LCID` | optional | Collation, port, enable Agent, locale |
 
@@ -83,11 +85,16 @@ docker run -d --name sql2022 \
 
 The databases live under **`/var/opt/mssql`**. **Without a persistent volume the data is destroyed when the container is removed.** Mount a named volume (or bind mount) at `/var/opt/mssql` so data survives container restarts/recreations.
 
+### Production caveats (non-root, ownership, memory limits)
+
+- **Non-root by default (2019+):** the official image runs the engine as the non-root user **`mssql` (UID 10001, group 0/root)**, not root. This is a hardening win but means **mounted-volume ownership matters** — the path mounted at `/var/opt/mssql` must be writable by UID 10001 (the container must run as part of the root group unless that volume is accessible to the non-root user), or the engine fails to start. Set ownership/permissions on bind mounts and configure `fsGroup`/`securityContext` on Kubernetes PVCs accordingly.
+- **Memory limits must exceed `memory.memorylimitmb`:** set the **pod/cgroup memory limit higher than** SQL's configured `memory.memorylimitmb` (and `max server memory`), leaving headroom for the OS/other process memory. If the cgroup limit is at or below what SQL targets, the container gets **OOM-killed** under load. Size the limit as SQL's memory target plus headroom, not equal to it.
+
 ### Kubernetes
 
 - Deploy as a **StatefulSet** (stable network identity + a `PersistentVolumeClaim` per pod) — not a Deployment — because SQL Server is stateful.
 - Expose via a `Service` (ClusterIP/LoadBalancer) on 1433; put the `sa` password and certs in **Secrets**.
-- Set resource **requests/limits** consistent with `memory.memorylimitmb` so the pod is not OOM-killed.
+- Set the pod memory **limit above** `memory.memorylimitmb` (leave OS headroom) so the pod is not OOM-killed; set `fsGroup`/`securityContext` so the PVC is writable by the non-root `mssql` UID 10001.
 - For HA, use a **Kubernetes operator** that orchestrates Always On AGs across pods (the bare engine in k8s does not self-cluster). HA design is **sqlserver-ha-clustering**.
 - Containers are ideal for **dev/test/CI**; production container deployments need deliberate storage classes (low-latency PVs), anti-affinity, and an HA operator.
 
@@ -177,7 +184,7 @@ The Browser listens on **UDP 1434** and tells clients which dynamic port a named
 
 ### Dedicated Admin Connection (DAC)
 
-The **DAC** reserves a dedicated scheduler and memory so you can connect when the instance is otherwise unresponsive. It is local-only by default; allow remote use with `sp_configure 'remote admin connections', 1` (see `instance-configuration.md`). Connect with `sqlcmd -A` (or `ADMIN:` prefix). Only one DAC session at a time; use it for break-glass diagnosis, not routine work.
+The **DAC** reserves a dedicated scheduler and memory so you can connect when the instance is otherwise unresponsive. The **local DAC** (`sqlcmd -A` from the box console) is **always available** regardless of configuration. Keep **`remote admin connections` OFF (0)** by default; enable (=1) **ONLY** for a documented break-glass need, e.g. a clustered/AG instance whose active-node console is unreachable. If enabled, restrict the source to DBA jump hosts via the host firewall and audit its use (see `instance-configuration.md`). Connect with `sqlcmd -A` (or the `ADMIN:` prefix). Only one DAC session at a time; use it for break-glass diagnosis, not routine work. (Stance harmonized with **sqlserver-security**.)
 
 ### Encryption in transit (pointer)
 

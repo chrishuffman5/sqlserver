@@ -10,7 +10,7 @@ metadata:
 
 You are the SQL Server performance-monitoring and diagnostics expert for this plugin. Your job is to find *why* a workload is slow and prove it with data — not to guess. The single most important habit you enforce: **start with wait statistics**, then drill down methodically. Resist the urge to jump straight to a query the user is suspicious of; the engine itself tells you where it is stuck.
 
-This skill covers SQL Server 2016–2025 on the box product (Windows, Linux, containers) and the cloud (Azure SQL Database, Azure SQL Managed Instance, SQL on VM, AWS RDS). DMVs and feature availability differ across versions and platforms — inline version notes like "(2017+)" and "(2022+)" mark these. Deep cloud-specific monitoring (Azure metrics, `sys.dm_db_resource_stats`, DTU/vCore telemetry, Log Analytics) lives in **`sqlserver-cloud`**; this skill gives the engine-internal view that applies everywhere.
+This skill covers SQL Server 2016–2025 on the box product (Windows, Linux, containers) and the cloud (Azure SQL Database, Azure SQL Managed Instance, SQL on VM, AWS RDS, Google Cloud SQL for SQL Server). DMVs and feature availability differ across versions and platforms — inline version notes like "(2017+)" and "(2022+)" mark these. On managed cloud platforms (Azure SQL MI, AWS RDS, Google Cloud SQL) the engine-internal DMVs behave like box; the cloud-native telemetry on top of them (Azure metrics, `sys.dm_db_resource_stats`, DTU/vCore telemetry, RDS/Cloud SQL Performance Insights, Log Analytics) lives in **`sqlserver-cloud`**. This skill gives the engine-internal view that applies everywhere.
 
 ## The Waits-First Diagnostic Methodology
 
@@ -106,8 +106,8 @@ ALTER DATABASE [MyDB] SET QUERY_STORE = ON
 What it unlocks:
 
 - **Top / regressed queries** by duration, CPU, reads, or wait time — with full history.
-- **Plan forcing** to pin a known-good plan: `EXEC sp_query_store_force_plan @query_id=…, @plan_id=…;` (`sp_query_store_unforce_plan` to release).
-- **Query Store hints (2022+)** — apply hints without touching code: `EXEC sp_query_store_set_hints @query_id=…, @query_hints=N'OPTION(MAXDOP 1, RECOMPILE)';`.
+- **Plan forcing** `[PERFORMANCE CHANGE]` to pin a known-good plan (`sp_query_store_force_plan` / `sp_query_store_unforce_plan`). Treat as a production change — see the gated, pre-flighted **Change Templates** in `references/query-store.md`; never run a bare `EXEC` with example IDs.
+- **Query Store hints (2022+)** `[PERFORMANCE CHANGE]` — apply hints without touching code (`sp_query_store_set_hints` / `sp_query_store_clear_hints`); same gating, same Change Templates section.
 - **Readable-secondary capture (2022+)** and **default-on in Azure SQL DB/MI**.
 
 Configuration, catalog views, sizing/cleanup, the regression query, and hint workflows: **`references/query-store.md`**.
@@ -119,7 +119,13 @@ Extended Events (XEvents) is the lightweight, low-overhead tracing infrastructur
 - **`system_health`** session is always running and already captures deadlocks (`xml_deadlock_report`), severe errors (severity ≥ 20), memory errors, and long latch/lock waits — check it *first* before building anything.
 - **Building a session**: pick the *event* (e.g. `sql_statement_completed`, `rpc_completed`, `xml_deadlock_report`), add a *predicate* to filter cheaply at the source (`WHERE duration > 5000000` — microseconds), attach only the *actions* you need (`sqlserver.sql_text`, `sqlserver.session_id`), and choose a *target*.
 - **Targets**: `ring_buffer` (in-memory, transient, good for ad-hoc) vs `event_file` (`.xel` on disk, durable, good for history). Read `.xel` with `sys.fn_xe_file_target_read_file()`. Use `EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS` so tracing never blocks the workload.
-- **`blocked_process_report`** requires enabling the blocked-process threshold first: `EXEC sp_configure 'blocked process threshold', 20; RECONFIGURE;` (seconds).
+- **`blocked_process_report`** requires enabling the blocked-process threshold first — a `[CONFIG CHANGE]` (commented template; see `references/extended-events-and-counters.md`):
+  ```sql
+  -- [CONFIG CHANGE] persists instance-wide; adds a small monitor overhead. Value in SECONDS.
+  -- EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+  -- EXEC sp_configure 'blocked process threshold', 20; RECONFIGURE;
+  -- EXEC sp_configure 'show advanced options', 0; RECONFIGURE;  -- reset
+  ```
 - XEvents replaces SQL Trace / Profiler (deprecated) at far lower overhead — never recommend a server-side trace for new work.
 
 Architecture, ready-to-run session DDL, reading targets, and key Perfmon counters (with the ratio/base and per-second delta patterns): **`references/extended-events-and-counters.md`**.
@@ -137,7 +143,7 @@ For live blocking:
 
 For deadlocks: pull the `xml_deadlock_report` from `system_health` (script `06`), or stand up a dedicated `event_file` session for durable history. Read the graph: the victim is marked, the resource nodes show which objects/keys collided, and the process nodes show the input buffers. Resolution is usually consistent lock ordering, shorter transactions, a covering index to avoid the lookup that caused the second lock, or RCSI to remove reader/writer conflicts.
 
-The `sp_whoisactive` community procedure (Adam Machanic) is the single best ad-hoc "what's happening right now" tool — it wraps the live DMVs with sane defaults. Script `10-active-requests.sql` here gives a dependency-free equivalent.
+The `sp_whoisactive` community procedure (Adam Machanic) is the single best ad-hoc "what's happening right now" tool — it wraps the live DMVs with sane defaults. Script `10-active-requests.sql` here gives a dependency-free equivalent. For broader optional tooling — Brent Ozar's First Responder Kit (`sp_Blitz*`) and Erik Darling's PerformanceMonitor — and how each maps to a workflow step, see **`references/community-diagnostic-tools.md`**.
 
 ## Baselining
 
@@ -186,8 +192,9 @@ The same pattern applies to `sys.dm_io_virtual_file_stats` and `sys.dm_os_perfor
 
 - **`references/diagnostic-workflow.md`** — the full waits-first methodology; instance-level wait query with the comprehensive benign-wait filter; signal vs resource waits; wait category → root cause → next-step table; clearing waits (caveats); per-session (`sys.dm_exec_session_wait_stats`, 2016+) and per-query (`sys.query_store_wait_stats`, 2017+) waits.
 - **`references/dmv-reference.md`** — categorized DMV catalog with example queries: execution/perf, I/O, memory, index usage, OS/scheduler, transactions/version store.
-- **`references/query-store.md`** — enable/configure all options; catalog views; top/regressed queries; forcing/unforcing plans; Query Store hints (2022+); QS on readable secondaries (2022+); default-on in Azure SQL DB/MI; sizing & cleanup.
-- **`references/extended-events-and-counters.md`** — XEvents architecture and sessions; `system_health`; ring_buffer vs event_file; reading `.xel`; blocked-process report; key Perfmon counters via `sys.dm_os_performance_counters` (ratio/base and per-second delta patterns).
+- **`references/query-store.md`** — enable/configure all options; catalog views; top/regressed queries; forcing/unforcing plans; Query Store hints (2022+); 2022 query-intelligence telemetry (`sys.query_store_plan_feedback`, PSP variants); QS on readable secondaries (2022+); default-on in Azure SQL DB/MI; sizing & cleanup; gated **Change Templates** for the mutating operations.
+- **`references/extended-events-and-counters.md`** — XEvents architecture and sessions; `system_health`; ring_buffer vs event_file; reading `.xel`; Azure SQL DB database-scoped sessions to Blob Storage; blocked-process report; key Perfmon counters via `sys.dm_os_performance_counters` (ratio/base and per-second delta patterns).
+- **`references/community-diagnostic-tools.md`** — optional, widely-used community tools that complement the bundled scripts and waits-first workflow: Brent Ozar First Responder Kit (sp_Blitz*) and Erik Darling PerformanceMonitor; how each maps to a workflow step, install pointers, MIT attribution, and change-class/safety notes.
 
 ## Scripts
 

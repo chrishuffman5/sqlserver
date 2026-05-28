@@ -95,9 +95,12 @@ ALTER EVENT SESSION [DeadlockCapture] ON SERVER STATE = START;
 The `blocked_process_report` event only fires if the **blocked process threshold** is enabled (it is off by default). The threshold is in *seconds*; SQL Server raises the report when a process is blocked that long.
 
 ```sql
--- One-time prerequisite (value in SECONDS). 20s is a reasonable production starting point.
+-- [CONFIG CHANGE] One-time prerequisite (value in SECONDS). 20s is a reasonable production starting point.
+-- This persists instance-wide and adds a small background monitor overhead; setting it to 0 disables it.
+-- 'show advanced options' is itself an advanced-options toggle — reset it to 0 afterward to leave config clean.
 EXEC sp_configure 'show advanced options', 1;  RECONFIGURE;
 EXEC sp_configure 'blocked process threshold', 20;  RECONFIGURE;
+EXEC sp_configure 'show advanced options', 0;  RECONFIGURE;   -- reset advanced-options visibility
 GO
 
 CREATE EVENT SESSION [BlockedProcessReport] ON SERVER
@@ -178,6 +181,34 @@ ORDER BY s.name;
 ```
 
 Keep sessions lean: minimal events, tight predicates, only the actions you need, `ALLOW_SINGLE_EVENT_LOSS` so tracing never blocks the workload, and a bounded file set. Drop ad-hoc sessions after the investigation.
+
+### Azure SQL Database: database-scoped sessions to Blob Storage
+
+On **Azure SQL Database** there is no instance, so every session is **database-scoped**: use `CREATE EVENT SESSION ... ON DATABASE` (not `ON SERVER`), and the event set is narrower than box/MI. The `event_file` target **cannot write to a local path** — there is no local disk you can address — it must write the `.xel` to **Azure Blob Storage**. That requires, one-time:
+
+1. A storage account + a blob **container**.
+2. Authorization for the logical server to write to it — either the server's **managed identity** granted *Storage Blob Data Contributor* on the container, or a **SAS token** with `rwdl` (read/write/delete/list) permission.
+3. A **database-scoped credential** whose name is the **container URL** (no trailing slash), pointing at that identity/SAS.
+
+```sql
+-- Azure SQL DB only. SECRET must come from a secret manager — never commit; rotate any value ever copied.
+-- [SECURITY CHANGE] creates a DB-scoped credential.
+-- CREATE DATABASE SCOPED CREDENTIAL [https://<account>.blob.core.windows.net/<container>]
+--     WITH IDENTITY = 'SHARED ACCESS SIGNATURE',
+--          SECRET   = N'<generate-32+char-random-secret>';   -- SAS token (no leading '?')
+
+CREATE EVENT SESSION [LongRunningStatements] ON DATABASE   -- ON DATABASE, not ON SERVER
+ADD EVENT sqlserver.sql_statement_completed (WHERE duration > 5000000)
+ADD TARGET package0.event_file
+(
+    SET filename = N'https://<account>.blob.core.windows.net/<container>/LongRunningStatements.xel'
+)
+WITH (MAX_MEMORY = 8 MB, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = ON);
+GO
+ALTER EVENT SESSION [LongRunningStatements] ON DATABASE STATE = START;
+```
+
+Read it back with the same `sys.fn_xe_file_target_read_file()` passing the blob URL. **Managed Instance** behaves like box (server-scoped sessions, local/UNC file targets). Verify the current event surface and credential steps on Microsoft Learn for your tier. Details in `sqlserver-cloud`.
 
 ---
 

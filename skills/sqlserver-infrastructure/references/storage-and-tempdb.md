@@ -63,6 +63,14 @@ These averages are **since service start** — a one-off spike during startup/ba
 - **NTFS** for the engine; **ReFS** is supported and useful for some scenarios (large files, integrity streams) but verify per workload — NTFS remains the default recommendation for data/log.
 - Exclude SQL data/log/backup paths and the `sqlservr.exe`/`sqlagent.exe` processes from real-time **antivirus** scanning, or AV will intercept every I/O.
 
+### File system on Linux (parallel to the NTFS guidance)
+
+On SQL Server on Linux there is no NTFS 64 KB allocation-unit knob; the equivalent tuning is:
+
+- Use **XFS** or **ext4** (both supported); **XFS** is commonly preferred for large database files. SQL data lives under `/var/opt/mssql` by default — `chown mssql:mssql` the data/log paths.
+- Mount data/log volumes appropriately (e.g., `noatime` to avoid access-time writes); align/format per your storage vendor's guidance. There is no 8.3-name concept.
+- Exclude SQL paths from any host antivirus/security agent, same as on Windows. Verify the supported filesystem matrix for your version on Microsoft Learn.
+
 ### Autogrowth
 
 - **Never percentage growth.** A 10% growth on a 100 GB file is a 10 GB event mid-business-hours, and successive growths get ever larger.
@@ -103,6 +111,7 @@ tempdb is the single most common platform misconfiguration and the source of the
 | > 8 | **8** files to start; add in groups of 4 only if contention persists |
 
 - **`file count = min(logical cores, 8)`** is the rule. More than 8 rarely helps and is added only in response to measured, persistent allocation contention.
+- **Modern nuance (2019+):** allocation improvements — concurrent PFS updates (2019+) and **memory-optimized tempdb metadata** — have reduced how much extra files matter, so `min(cores, 8)` plus metadata optimization usually resolves contention without piling on files; only add more (in groups of 4) on *measured* PAGELATCH contention. Verify the current allocation behavior for your build on Microsoft Learn.
 - **All data files equal size and equal growth** — proportional fill only balances allocations across files of equal size; one larger file becomes a hotspot and defeats the purpose.
 - **Pre-size** to the expected steady-state high-water mark so tempdb never autogrows during business hours; fixed-MB growth, never percent.
 - **One log file** is sufficient (logs do not benefit from multiple files).
@@ -131,10 +140,10 @@ Allocations to tempdb objects use **uniform extents by default from SQL Server 2
 A major remaining contention point was the tempdb **system metadata** tables (allocation/object metadata) under heavy temp-object churn. SQL Server **2019+** can move that metadata to **memory-optimized** (latch-free) structures:
 
 ```sql
--- Check current state (2019+)
+-- Check current state (2019+) — read-only
 SELECT SERVERPROPERTY('IsTempdbMetadataMemoryOptimized') AS is_memopt_tempdb_metadata;  -- 1 = on
 
--- Enable (requires a service restart to take effect)
+-- [CONFIG CHANGE] enabling REQUIRES A SERVICE RESTART to take effect. Confirm the target instance; rollback = set OFF + restart.
 -- ALTER SERVER CONFIGURATION SET MEMORY_OPTIMIZED TEMPDB_METADATA = ON;
 ```
 
@@ -166,6 +175,13 @@ ORDER BY elapsed_time_seconds DESC;                      -- the long transaction
 ```
 
 The fix is operational/engineering (kill or fix the long transaction, shorten transaction scope) — the infrastructure decision is to **size tempdb for the worst-case version-store footprint** if you run RCSI/snapshot heavily.
+
+### ADR and the Persistent Version Store (PVS) — shifts version storage out of tempdb (2019+)
+
+**Accelerated Database Recovery (ADR)**, available from SQL Server **2019+** (and in Azure SQL DB/MI), keeps row versions in a **Persistent Version Store (PVS)** that lives **in the user database itself** (by default the PRIMARY filegroup; movable to another filegroup) rather than in tempdb's version store. When ADR is enabled on a database, that database's versioning load moves **off tempdb and into the user DB's PVS** — so the tempdb version-store component shrinks, while the user database's data files must absorb (and be sized for) the PVS.
+
+- Sizing implication: with ADR on, lower the tempdb headroom you reserve for the version store, and add it to the user-database data-file budget instead. Watch PVS size with `sys.dm_tran_persistent_version_store_stats`; a stuck PVS (oldest open transaction) bloats the user DB, not tempdb.
+- **Optimized locking** (SQL Server **2025** / Azure SQL DB/MI) builds on ADR/PVS and RCSI; it reduces lock memory and escalation (see `memory-and-cpu.md`) but, because it relies on row versioning, reinforces the need to size the **PVS** in the user database. Verify version/edition support on Microsoft Learn for your build.
 
 ### tempdb sizing worked example
 

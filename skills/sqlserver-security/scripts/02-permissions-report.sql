@@ -9,6 +9,11 @@
  * Targets : SQL Server 2016+ (box) and Azure SQL MI. On Azure SQL Database the
  *           server-level sections are limited; per-DB sections run.
  * Safety  : READ-ONLY. No GRANT/DENY/REVOKE or role changes are performed.
+ * Note    : Per-database sections use sys.sp_MSforeachdb, which is UNDOCUMENTED
+ *           and unsupported, can SILENTLY SKIP databases, and is UNAVAILABLE on
+ *           Azure SQL Database. For production estates, prefer a supported
+ *           explicit cursor over sys.databases (state_desc = 'ONLINE') to
+ *           guarantee every database is covered.
  *
  * Sections:
  *   1. Server-Level Permissions (sys.server_permissions)

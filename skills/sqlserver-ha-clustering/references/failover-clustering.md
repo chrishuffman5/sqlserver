@@ -31,14 +31,55 @@ WSFC does **not** know what SQL Server is — SQL Server registers resources and
 
 General rule: **always have an odd total number of votes.** With an even node count, add a witness (file share, disk, or cloud) so ties can be broken.
 
-### Dynamic quorum & dynamic witness (2012 R2+ / current Windows Server)
+### Dynamic quorum & dynamic witness (current Windows Server)
 
-Modern WSFC manages votes automatically:
-- **Dynamic quorum** — WSFC removes a node's vote when it leaves so the cluster can keep running down to the **last surviving node** (the cluster "drops" votes to maintain a workable majority).
-- **Dynamic witness** — WSFC automatically decides whether the witness gets a vote based on the current number of voting nodes (witness votes when node count is even, doesn't when odd) — so you can **always configure a witness** and let WSFC decide when it counts.
-- **Node votes** — you can manually remove a vote from a node (`(Get-ClusterNode X).NodeWeight = 0`) to keep multi-site vote counts sane (e.g., zero out votes at the DR site so the primary site retains majority during a WAN partition).
+Modern WSFC manages votes automatically. These are **two distinct features introduced in different OS versions** (verify specifics on Microsoft Learn for your Windows Server build):
+- **Dynamic quorum** — **introduced in Windows Server 2012** (enabled by default). WSFC removes a node's vote when it leaves active membership (and re-adds it on rejoin) so the cluster can keep running down to the **last surviving node** by dynamically adjusting the majority requirement.
+- **Dynamic witness** — **introduced in Windows Server 2012 R2** (on top of dynamic quorum). WSFC automatically decides whether the **witness** gets a vote based on the current number of voting nodes — the witness votes when the node count is **even**, and does not when **odd** (and its vote drops to 0 if the witness resource is offline/failed). So you can **always configure a witness** and let WSFC decide when it counts; this is the documented recommendation on 2012 R2+.
+- **Node votes** — you can manually remove a vote from a node (`(Get-ClusterNode X).NodeWeight = 0`) to keep multi-site vote counts sane (e.g., zero out votes at the DR site so the primary site retains majority during a WAN partition). See §2a.
 
 Inspect from SQL Server: `sys.dm_hadr_cluster` (`quorum_type_desc`, `quorum_state_desc`) and `sys.dm_hadr_cluster_members` (`number_of_quorum_votes`, `member_state_desc`). See `scripts/05-cluster-health.sql`.
+
+### 2a. Configuring quorum & votes (PowerShell)
+
+These are **OS-level cluster changes** — run deliberately, in a window, with cluster admin rights; they can affect cluster availability. Confirm the cluster name first with `Get-ClusterQuorum`.
+
+```powershell
+# Inspect current quorum configuration (read-only)
+Get-ClusterQuorum
+Get-ClusterNode | Format-Table Name, NodeWeight, State, DynamicWeight
+
+# Cloud Witness (Azure blob) — preferred when there's no reliable third site.
+# Secret: source the storage access key from a secret manager / Key Vault; never commit it; rotate if exposed.
+Set-ClusterQuorum -CloudWitness -AccountName '<storage-account>' -AccessKey '<generate-from-key-vault>'
+
+# File-share witness — lightweight SMB share on an independent host (not a cluster node).
+Set-ClusterQuorum -FileShareWitness '\\witnesshost\wsfc-witness$'
+
+# Node majority, no witness (odd node counts only)
+Set-ClusterQuorum -NodeMajority
+```
+
+**Multi-site vote management** — zero out DR-site node votes so a WAN partition can't hand quorum to the wrong side; keep an odd voting total at the primary site (let dynamic witness handle the witness vote):
+```powershell
+# Remove the quorum vote from each DR-site node (run on a cluster node)
+(Get-ClusterNode 'DRNODE1').NodeWeight = 0
+(Get-ClusterNode 'DRNODE2').NodeWeight = 0
+# Verify
+Get-ClusterNode | Format-Table Name, NodeWeight
+```
+
+### 2b. Flexible failover policy: `FailureConditionLevel` & `HealthCheckTimeout`
+
+For an **FCI** (and surfaced by `scripts/01`), WSFC decides failover for SQL Server using SQL's `sp_server_diagnostics` health feed, governed by two cluster-resource properties:
+- **`HealthCheckTimeout`** (default **60000 ms**) — how long WSFC waits for a health response before treating the instance as unresponsive.
+- **`FailureConditionLevel`** (**1–5**, default **3**) — how aggressive failover is, escalating with the level:
+  - **1** — fail over only on the SQL Server service going down.
+  - **2** — also on unresponsiveness (health check timeout / no connectivity).
+  - **3** (default) — also on **critical** server errors (e.g., orphaned spinlocks, severe internal errors).
+  - **4** — also on **moderate** errors (e.g., persistent out-of-memory).
+  - **5** — on **any** qualified failure condition (most aggressive).
+- Set via `ALTER SERVER CONFIGURATION SET FAILOVER CLUSTER PROPERTY` (or the cluster resource) — `[CONFIG CHANGE]`, tune deliberately. Higher levels react faster but risk failover on transient blips; verify the exact condition lists on Microsoft Learn for your build.
 
 ## 3. FCI Architecture (Instance-Level HA)
 
@@ -51,7 +92,7 @@ A **Failover Cluster Instance** is a single SQL Server instance installed across
 - **Failover is fast** (no reseeding — same storage), bounded mainly by recovery/redo of the database on the new owner. **Accelerated Database Recovery** (2019+) shortens this.
 
 ### FCI failover triggers
-Node failure, OS crash, storage path failure, a failed health check (`FailureConditionLevel`), or a manual move. WSFC restarts the instance on a healthy node.
+Node failure, OS crash, storage path failure, a failed health check (`FailureConditionLevel` / `HealthCheckTimeout` — see §2b), or a manual move. WSFC restarts the instance on a healthy node.
 
 ## 4. FCI vs AG
 

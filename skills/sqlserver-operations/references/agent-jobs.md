@@ -35,18 +35,24 @@ Agent metadata lives in **`msdb`** (`sysjobs`, `sysjobsteps`, `sysjobschedules`,
 ```sql
 USE msdb;
 
--- 1) The job (owned by a low-privilege login, NOT a person)
+-- 1) The job (owned by a dedicated low-privilege SERVICE login, NOT a person and NOT sa).
+--    sa-owned jobs are an anti-pattern: every step then runs with full sysadmin authority, the job
+--    survives staff turnover only by accident, and if sa is disabled/renamed (a hardening baseline)
+--    the job breaks. Own jobs with a purpose-built login granted only the rights the steps need.
 EXEC dbo.sp_add_job
     @job_name        = N'Nightly Log Backups',
-    @owner_login_name = N'sa',          -- or a dedicated service login
+    @owner_login_name = N'svc_sqlagent_jobs',   -- dedicated least-privilege login; never N'sa'
     @description     = N'Backs up transaction logs for user databases.';
 
 -- 2) A T-SQL step
+--    @database_name is the context the step runs in. Ola's procs live in a dedicated DBA/utility DB
+--    (commonly [DBA] or [master] only if you chose to install them there) — point at wherever you
+--    installed them, not blindly N'master'.
 EXEC dbo.sp_add_jobstep
     @job_name   = N'Nightly Log Backups',
     @step_name  = N'Backup logs',
     @subsystem  = N'TSQL',
-    @database_name = N'master',
+    @database_name = N'DBA',            -- the DB where Ola's IndexOptimize/DatabaseBackup are installed
     @command    = N'EXEC dbo.DatabaseBackup @Databases=''USER_DATABASES'', @BackupType=''LOG'', @Compress=''Y'', @Verify=''Y'';',
     @retry_attempts = 2,
     @retry_interval = 5,                -- minutes
@@ -100,8 +106,14 @@ Useful management procs: `sp_start_job`, `sp_stop_job`, `sp_update_jobstep`, `sp
 Non-T-SQL steps (CmdExec, PowerShell, SSIS) run under the Agent service account by default. To follow least privilege, create a **credential** (mapped to a Windows/domain account) and a **proxy** for that subsystem, then run the step as the proxy. This avoids giving the Agent service account broad OS rights.
 
 ```sql
--- Credential (server level) → Proxy (Agent) → assign to subsystem
-CREATE CREDENTIAL [BackupFileCred] WITH IDENTITY = N'DOMAIN\svc-sqlbackup', SECRET = N'***';
+-- [SECURITY CHANGE] Credential (server level) → Proxy (Agent) → assign to subsystem.
+-- PREFER a group Managed Service Account (gMSA): a gMSA credential stores NO password in SQL Server
+-- (Windows rotates it automatically) — CREATE CREDENTIAL ... WITH IDENTITY = N'DOMAIN\svc-sqlbackup$' and
+-- omit SECRET. Only use a password when a gMSA isn't possible; then source it from a secret manager,
+-- never commit it, and avoid leaving it in T-SQL/shell history.
+CREATE CREDENTIAL [BackupFileCred]
+    WITH IDENTITY = N'DOMAIN\svc-sqlbackup$';   -- gMSA: no SECRET needed
+-- Non-gMSA fallback (avoid): ... WITH IDENTITY = N'DOMAIN\svc-sqlbackup', SECRET = N'<generate-32+char-random-secret>';
 EXEC msdb.dbo.sp_add_proxy @proxy_name = N'BackupFileProxy', @credential_name = N'BackupFileCred', @enabled = 1;
 EXEC msdb.dbo.sp_grant_proxy_to_subsystem @proxy_name = N'BackupFileProxy', @subsystem_id = 11; -- 11 = PowerShell
 ```
@@ -111,6 +123,7 @@ EXEC msdb.dbo.sp_grant_proxy_to_subsystem @proxy_name = N'BackupFileProxy', @sub
 Database Mail is the SMTP-based notification transport. Set up a **profile** containing one or more **accounts** (SMTP server, port, credentials), then enable Agent to use it.
 
 ```sql
+-- [CONFIG CHANGE] Instance-wide: enables the Database Mail XPs surface area. Rollback: set the option back to 0.
 -- 1) Enable Database Mail XPs
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'Database Mail XPs', 1;     RECONFIGURE;

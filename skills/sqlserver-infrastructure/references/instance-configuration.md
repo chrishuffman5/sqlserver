@@ -16,6 +16,7 @@ Server-level configuration (`sp_configure`) and database-scoped configuration th
 `RECONFIGURE` promotes `value` → `value_in_use` for settings that take effect without a restart. Settings flagged as **self-configuring / restart-required** (e.g., `max worker threads`, `priority boost`, `lightweight pooling`, `affinity mask`) stay pending — `value <> value_in_use` — until the service restarts. Script 01 surfaces exactly this gap so you can tell "set but not active" from "set and live."
 
 ```sql
+-- [CONFIG CHANGE] confirm the target instance; RECONFIGURE applies immediately. Substitute computed values.
 -- Advanced settings are hidden until you turn them on
 EXEC sp_configure 'show advanced options', 1;
 RECONFIGURE;
@@ -56,7 +57,7 @@ max server memory = Total RAM
 | 256 GB | ~32–40 GB | ~216–224 GB (~221184 MB) |
 
 ```sql
--- 64 GB dedicated box: 64 − 4 − ((64−16)/4) = 48 GB
+-- [CONFIG CHANGE] 64 GB dedicated box: 64 − 4 − ((64−16)/4) = 48 GB. Replace 49152 with your computed value.
 EXEC sp_configure 'max server memory (MB)', 49152;
 RECONFIGURE;
 ```
@@ -80,6 +81,7 @@ LPIM, NUMA balancing, and the memory regions themselves are covered in `memory-a
 The optimizer considers a parallel plan only when the serial plan's estimated cost exceeds this threshold. The default of **5** dates to single-CPU hardware and is far too low — trivial queries get parallel plans, paying coordination overhead (`CXPACKET`/`CXCONSUMER`) for no benefit.
 
 ```sql
+-- [CONFIG CHANGE] applies immediately; tune per workload. Confirm the target instance.
 EXEC sp_configure 'cost threshold for parallelism', 50;  -- start at 50, then tune
 RECONFIGURE;
 ```
@@ -101,6 +103,7 @@ Starting point (Microsoft's guidance and field practice):
 | Data warehouse / reporting | 4–8 (let bigger queries parallelize) |
 
 ```sql
+-- [CONFIG CHANGE] replace 8 with physical cores per NUMA node (cap 8); applies immediately. Confirm the target instance.
 EXEC sp_configure 'max degree of parallelism', 8;
 RECONFIGURE;
 ```
@@ -114,6 +117,7 @@ Count **physical** cores, not logical — do not include hyperthreads in the per
 ### `optimize for ad hoc workloads`
 
 ```sql
+-- [CONFIG CHANGE] safe and broadly beneficial; applies immediately. Confirm the target instance.
 EXEC sp_configure 'optimize for ad hoc workloads', 1;
 RECONFIGURE;
 ```
@@ -133,6 +137,7 @@ On first execution of an ad-hoc batch, SQL caches a small **plan stub** instead 
 ### `backup compression default`
 
 ```sql
+-- [CONFIG CHANGE] sets the instance default; applies immediately. Edition gate: Standard+ from 2016 SP1.
 EXEC sp_configure 'backup compression default', 1;
 RECONFIGURE;
 ```
@@ -145,16 +150,20 @@ Makes every backup compressed unless overridden. Smaller and usually *faster* (l
 
 ### `remote admin connections` (the DAC)
 
+Keep this **OFF (0)** by default — the **local** DAC (`sqlcmd -A` from the box console) is always available regardless of this setting. Enable (=1) **ONLY** for a documented break-glass need, e.g. a clustered/AG instance whose active-node console is unreachable. If you enable it, restrict the source to DBA jump hosts via the host firewall and audit its use.
+
 ```sql
-EXEC sp_configure 'remote admin connections', 1;  -- allow the DAC from remote hosts
-RECONFIGURE;
+-- [CONFIG CHANGE] OPT-IN ONLY: enables the DAC from REMOTE hosts. Default/secure state is 0.
+-- Confirm a documented break-glass justification first; restrict source to DBA jump hosts via firewall; audit use.
+-- EXEC sp_configure 'remote admin connections', 1;  RECONFIGURE;  -- leave commented unless break-glass is approved
 ```
 
-The **Dedicated Admin Connection** reserves a scheduler and memory so you can connect to a hung instance (`sqlcmd -A`). By default the DAC is local-only; setting this to 1 allows it from another machine — essential when the box is so wedged you cannot RDP in. Connection/port plumbing is in `platform-and-network.md`.
+The **Dedicated Admin Connection** reserves a scheduler and memory so you can connect to a hung instance (`sqlcmd -A`). By default the DAC is local-only; setting this to 1 allows it from another machine — useful when the box is so wedged you cannot reach the console, but it widens the attack surface, so treat it as conditional, not a baseline. Connection/port plumbing is in `platform-and-network.md`. (This stance is harmonized with **sqlserver-security**.)
 
 ### `blocked process threshold (s)`
 
 ```sql
+-- [CONFIG CHANGE] applies immediately; pairs with an XEvent capture. Confirm the target instance.
 EXEC sp_configure 'blocked process threshold', 15;  -- seconds; 0 = off
 RECONFIGURE;
 ```
@@ -169,10 +178,9 @@ When a process is blocked longer than this, SQL generates a **blocked-process re
 |---|---|---|
 | `priority boost` | **0 (off)** | Raises SQL's Windows priority above OS threads — starves the OS, can hang the box, and is unsupported with clustering. Never enable. (Restart required even to set.) |
 | `lightweight pooling` | **0 (off)** | Fiber mode; breaks CLR, linked servers, Extended Stored Procs, and more. Almost never appropriate. |
-| `default fill factor` | **0 (=100)** | A global non-100 fill factor wastes space across *every* index. Set fill factor per-index where needed, not server-wide. |
+| `fill factor (%)` | **0 (=100)** | A global non-100 fill factor wastes space across *every* index. Set fill factor per-index where needed, not server-wide. (Restart required to change.) |
 | `affinity mask` / `affinity I/O mask` | default (auto) | Only pin CPUs when intentionally partitioning cores between instances. See `memory-and-cpu.md`. |
-| `fill factor` server default | 0 | Same as above. |
-| `network packet size` | 4096 | Default is right for almost everyone; only large bulk/ETL flows benefit from raising it. |
+| `network packet size (B)` | 4096 | Default is right for almost everyone; only large bulk/ETL flows benefit from raising it. |
 | `cross db ownership chaining` | 0 (off) | Security risk; enable per-database only if truly required (cross-ref **sqlserver-security**). |
 | `clr enabled` | per requirement | Off by default; enable only if you run CLR assemblies, and prefer `clr strict security` on (2017+). |
 
@@ -193,7 +201,10 @@ When a process is blocked longer than this, SQL generates a **blocked-process re
 | `ELEVATE_ONLINE` / `ELEVATE_RESUMABLE` | OFF | (2019+) auto-elevate index ops to ONLINE/RESUMABLE |
 
 ```sql
--- Per-database MAXDOP override
+-- [CONFIG CHANGE] scoped to the CURRENT database — confirm you are in the intended one (SELECT DB_NAME();) before running.
+-- Substitute computed per-environment values. These take effect immediately; rollback = re-set the prior value.
+
+-- Per-database MAXDOP override (e.g., physical cores per NUMA node)
 ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4;
 
 -- Different MAXDOP on the readable secondary (e.g., reporting offload)
@@ -205,7 +216,7 @@ ALTER DATABASE SCOPED CONFIGURATION SET QUERY_OPTIMIZER_HOTFIXES = ON;
 -- Pin the legacy cardinality estimator for a regressed database
 ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = ON;
 
--- Inspect current values for the current database
+-- Inspect current values for the current database (read-only)
 SELECT configuration_id, name, value, value_for_secondary, is_value_default
 FROM   sys.database_scoped_configurations
 ORDER BY name;
@@ -220,23 +231,28 @@ Note `compatibility_level` (set with `ALTER DATABASE ... SET COMPATIBILITY_LEVEL
 Apply after confirming version/edition/platform and right-sizing inputs. All non-restart unless noted.
 
 ```sql
+-- [CONFIG CHANGE] Substitute computed per-environment values (do NOT paste the placeholders as-is).
+-- RECONFIGURE applies immediately; rollback = re-set the prior value. Run against the intended instance.
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 
 -- Memory: replace 49152 with your computed value (formula above)
 EXEC sp_configure 'max server memory (MB)', 49152;        RECONFIGURE;
 EXEC sp_configure 'min server memory (MB)', 0;            RECONFIGURE;
 
--- Parallelism: set MAXDOP to physical cores per NUMA node (cap 8)
+-- Parallelism: set MAXDOP to physical cores per NUMA node (cap 8) — replace 8 with your computed value
 EXEC sp_configure 'cost threshold for parallelism', 50;   RECONFIGURE;
 EXEC sp_configure 'max degree of parallelism', 8;         RECONFIGURE;
 
--- Plan cache & backups
+-- Plan cache & backups (backup compression: Standard+ from 2016 SP1)
 EXEC sp_configure 'optimize for ad hoc workloads', 1;     RECONFIGURE;
 EXEC sp_configure 'backup compression default', 1;        RECONFIGURE;
 
--- Break-glass & blocking visibility
-EXEC sp_configure 'remote admin connections', 1;          RECONFIGURE;
+-- Blocking visibility
 EXEC sp_configure 'blocked process threshold', 15;        RECONFIGURE;
+
+-- remote DAC: LEAVE OFF (0) by default; the local DAC is always available.
+-- Opt-in (=1) ONLY for a documented break-glass need; then firewall the source to DBA jump hosts and audit.
+EXEC sp_configure 'remote admin connections', 0;          RECONFIGURE;
 
 -- Confirm these are OFF
 EXEC sp_configure 'priority boost', 0;                    RECONFIGURE;  -- restart to change if it was on

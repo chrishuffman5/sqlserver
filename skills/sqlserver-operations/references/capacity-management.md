@@ -28,6 +28,7 @@ SELECT
 FROM sys.master_files mf
 ORDER BY database_name, mf.type_desc;
 
+-- [CONFIG CHANGE] Confirm DB via DB_NAME(); placeholder [MyDB]. Sets the file's autogrowth increment (metadata only).
 -- Set a sensible fixed growth (example: 512 MB)
 ALTER DATABASE [MyDB] MODIFY FILE (NAME = N'MyDB', FILEGROWTH = 512MB);
 ```
@@ -62,15 +63,19 @@ The transaction log is internally divided into Virtual Log Files. Their **count 
 - **Too many small VLFs** (from many tiny autogrowths) slow database startup/recovery, log backups, and replication/AG redo, and can degrade DML performance.
 - **Too few huge VLFs** make log space reuse coarse and can pin large amounts of log.
 
-Growth-size → VLFs added per growth (engine rule; refined in 2014+ to reduce VLF counts on small growths):
+Growth-size → VLFs added per growth. The size buckets below are the classic (pre-2014) rule; **SQL Server 2014+ adds a 1/8 rule on top**:
 
-| Growth increment | VLFs added |
+- **2014+ small-growth rule:** if a single growth is **< 1/8 of the current log's physical size**, the engine adds just **1 VLF** covering that growth (this is what keeps modern logs from exploding into thousands of tiny VLFs). Only when a growth is **≥ 1/8** of the current size do the classic size buckets apply:
+
+| Growth increment (when ≥ 1/8 of current log size) | VLFs added |
 |---|---|
 | ≤ 64 MB | 4 |
 | > 64 MB and ≤ 1 GB | 8 |
 | > 1 GB | 16 |
 
-So growing a log in **~8 GB chunks** yields 16 VLFs of ~512 MB each — a good balance. To right-size a bloated VLF count: back up the log, shrink the log file to near-empty, then grow it back in deliberate chunks to the target size. Aim for roughly low hundreds of VLFs at most for a large log, not thousands.
+- **SQL Server 2022+ (and Azure SQL DB), all editions:** the small-growth path changed — a growth **≤ 64 MB adds just 1 VLF** (instead of 4); 64 MB–1 GB still adds 8, and > 1 GB still adds 16.
+
+So growing a log in **~8 GB chunks** yields 16 VLFs of ~512 MB each — a good balance. To right-size a bloated VLF count: **back up the log first** (required on FULL/Bulk-logged before the log file will shrink — an un-backed-up log won't release space), shrink the log file to near-empty, then grow it back in deliberate chunks to the target size. Aim for roughly low hundreds of VLFs at most for a large log, not thousands. Verify the 1/8 rule on [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-transaction-log-architecture-and-management-guide) for your build. `sys.dm_db_log_info` also exposes each VLF's state (the `vlf_active` column flags which VLFs are currently active and thus pin the log).
 
 ```sql
 -- VLF count and detail per database (2016 SP2 / 2017+: sys.dm_db_log_info)
@@ -101,9 +106,11 @@ FROM sys.dm_db_log_space_usage;       -- one row for the current DB context
 **When shrink is acceptable:** a genuine one-off reclaim after a large *permanent* deletion (e.g., you archived/dropped half the data and won't need that space back). Then:
 
 ```sql
+-- [PERFORMANCE CHANGE] Confirm DB via DB_NAME(); approved window only — heavy I/O + scrambles index order.
+-- The follow-up REBUILD is OFFLINE on Standard (Enterprise/Developer/Evaluation or Azure SQL for ONLINE).
 -- One-off, deliberate: shrink, then immediately rebuild affected indexes
 DBCC SHRINKFILE (N'MyDB_Data', 20480);          -- target size in MB
-ALTER INDEX ALL ON dbo.LargeTable REBUILD;       -- repair the fragmentation you just caused
+ALTER INDEX ALL ON [dbo].[LargeTable] REBUILD;   -- repair the fragmentation you just caused
 ```
 
 For the **log**, shrinking to fix VLF count (as above) is legitimate; routine log shrinking to "save space" is not — size the log for its peak workload and leave it.
@@ -156,6 +163,7 @@ For Always On AGs and FCIs, patch with a **rolling upgrade** to minimize downtim
 - **Azure SQL Database / Managed Instance** — patched **by Microsoft**. You only control the **maintenance window** (choose off-peak) and get advance notification; there are no CUs to install.
 - **SQL on Azure VM** — box product; you patch, or enable the **SQL IaaS Agent extension automated patching** to apply updates in a defined window.
 - **AWS RDS** — you choose a target **engine version**; RDS applies it during the maintenance window (Multi-AZ patches the standby first, then fails over to minimize downtime). No manual CU install; no OS access.
+- **Google Cloud SQL for SQL Server** — fully managed: you choose a maintenance window and Google applies maintenance/minor updates (with configurable order/deny periods). Backups are automated with **point-in-time recovery via the Cloud SQL API/console** (driven by transaction-log retention); no OS access and no manual CU/`BACKUP DATABASE`. Monitor storage via Cloud Monitoring and enable automatic storage increase to avoid running out of space.
 
 ## Capacity / Servicing Checklist
 

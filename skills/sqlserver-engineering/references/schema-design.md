@@ -14,7 +14,7 @@ Normalize first; denormalize deliberately, with evidence.
 - **BCNF** — every determinant is a candidate key (a stricter 3NF).
 
 Normalization removes update anomalies and keeps writes cheap and consistent. **Denormalize only when** a measured read pattern demands it: a hot reporting query joining many tables, an aggregate computed repeatedly, or a high-fan-out lookup. When you do, choose a *maintained* mechanism over a hand-synced copy:
-- **Indexed (materialized) view** for pre-joined/pre-aggregated results the engine keeps current.
+- **Indexed (materialized) view** for pre-joined/pre-aggregated results the engine keeps current (§10).
 - **Persisted computed column** for a derived value (§5).
 - **Columnstore** for analytic aggregates over a normalized fact table (often removes the *need* to denormalize).
 
@@ -37,7 +37,11 @@ Type choice affects storage, memory grants, index width, and SARGability on *eve
 - **`IDENTITY`** — per-column auto-increment; simple, but you can't get the next value without inserting, and it's table-bound.
 - **`SEQUENCE`** (2012+) — a standalone object: share one sequence across tables, fetch values *before* insert (`NEXT VALUE FOR`), cache for throughput, define `MINVALUE/MAXVALUE/CYCLE`. Prefer `SEQUENCE` when you need the key before insertion, a cross-table key, or ranges.
 
-Both can leave gaps (rollbacks, cache loss on restart, the 2012 `IDENTITY` reseed-by-1000 jump under TF272/`IDENTITY_CACHE`). Gaps are normal — don't assume contiguity.
+Both can leave gaps (rollbacks, cache loss on restart). **Gaps are normal — never assume contiguity.** One specific cause is the **identity cache** (on since 2012): the engine reserves a block of values in memory and only durably logs the high-water mark periodically, so an **unexpected shutdown** (crash, failover, power loss — *not* a clean shutdown) discards the unused tail and the next value jumps ahead by **~1,000** (the typical cache size for `int`/`bigint`). To prevent that jump, **disable the cache**:
+- **Instance-wide:** **trace flag 272** (reverts to pre-2012 fully-logged allocation).
+- **Per database (2017+):** `[CONFIG CHANGE]` `ALTER DATABASE SCOPED CONFIGURATION SET IDENTITY_CACHE = OFF;` — same effect, scoped to one database; confirm target via `SELECT DB_NAME()`, rollback = `SET IDENTITY_CACHE = ON`.
+
+Disabling the cache trades a small per-insert logging cost for predictability. `SEQUENCE` caching behaves analogously (`NO CACHE` / explicit `CACHE n` controls it).
 
 ---
 
@@ -55,11 +59,16 @@ Constraints aren't just integrity rules; the optimizer **reasons** with trusted 
 A constraint added `WITH NOCHECK`, or after data was loaded around it, becomes **not trusted** (`is_not_trusted = 1`) — the optimizer **ignores it** for elimination even though it's still enforced for new rows. Re-validate so the optimizer trusts it:
 
 ```sql
--- Re-establish trust: WITH CHECK validates existing data and flips is_not_trusted to 0
-ALTER TABLE dbo.Child WITH CHECK CHECK CONSTRAINT FK_Child_Parent;
-ALTER TABLE dbo.T     WITH CHECK CHECK CONSTRAINT CK_T_Status;
+-- [SCHEMA CHANGE] Re-establish trust: WITH CHECK validates EVERY existing row (size-of-data scan)
+-- and flips is_not_trusted to 0. Takes a schema-modification lock that BLOCKS the table for the
+-- duration; confirm target DB (SELECT DB_NAME()) and run in an approved maintenance window.
+-- Rollback (re-disable, fast, leaves it untrusted) = ALTER TABLE ... NOCHECK CONSTRAINT <name>.
+ALTER TABLE dbo.[MyDB_Child] WITH CHECK CHECK CONSTRAINT FK_Child_Parent;
+ALTER TABLE dbo.[MyDB_T]     WITH CHECK CHECK CONSTRAINT CK_T_Status;
+```
 
--- Audit untrusted FK/CHECK constraints
+```sql
+-- Audit untrusted FK/CHECK constraints (read-only diagnostic)
 SELECT OBJECT_NAME(parent_object_id) AS [table], name, is_not_trusted
 FROM   sys.foreign_keys WHERE is_not_trusted = 1
 UNION ALL
@@ -76,15 +85,21 @@ A computed column is defined by an expression over other columns:
 - **`PERSISTED`** — materialized on disk and maintained on write; required for indexing if the expression is imprecise (e.g. `float`), and lets the value be read without recomputation.
 
 ```sql
-ALTER TABLE dbo.[Order]
+-- [SCHEMA CHANGE] Adding a PERSISTED computed column materializes the value for EVERY existing row
+-- (size-of-data) and takes a schema-modification lock that BLOCKS the table while it runs.
+-- Confirm target DB (SELECT DB_NAME()) and run in an approved maintenance window.
+ALTER TABLE dbo.[MyDB_Order]
     ADD LineTotal AS (Quantity * UnitPrice) PERSISTED;   -- maintained, indexable
 ```
 
 A key use: **make a non-SARGable predicate seekable.** Wrap the expression the queries actually use in a persisted computed column and index it:
 
 ```sql
-ALTER TABLE dbo.Person ADD UpperLastName AS UPPER(LastName) PERSISTED;
-CREATE INDEX IX_Person_UpperLastName ON dbo.Person(UpperLastName);
+-- [SCHEMA CHANGE] Both statements are size-of-data and take Sch-M locks that BLOCK the table;
+-- the OFFLINE index create is Sch-M too (ONLINE = ON is Enterprise/Azure-only). Confirm target DB
+-- and run in an approved maintenance window.
+ALTER TABLE dbo.[MyDB_Person] ADD UpperLastName AS UPPER(LastName) PERSISTED;
+CREATE INDEX IX_Person_UpperLastName ON dbo.[MyDB_Person](UpperLastName);
 -- Now WHERE UpperLastName = @n  seeks, where WHERE UPPER(LastName)=@n would scan.
 ```
 
@@ -103,6 +118,11 @@ Sparse columns optimize storage for columns that are **mostly NULL**: a NULL cos
 Partitioning splits one table/index into multiple physical units by a **partition function** on a single column, mapped to filegroups by a **partition scheme**. It is primarily a **manageability / data-lifecycle** feature — *not* a general query accelerator.
 
 ```sql
+-- [SCHEMA CHANGE] Partitioning DDL. Creating the objects is metadata-only, but partitioning an
+-- EXISTING populated table (rebuilding its clustered index onto the scheme) is size-of-data and
+-- takes a Sch-M lock that blocks the table — do that in an approved maintenance window; confirm
+-- target DB via SELECT DB_NAME(). Partitioning is available in ALL editions since SQL Server 2016 SP1.
+
 -- 1) Function: defines boundary values. RANGE RIGHT => boundary belongs to the partition on its RIGHT.
 CREATE PARTITION FUNCTION pf_OrderDate (date)
     AS RANGE RIGHT FOR VALUES ('2024-01-01', '2025-01-01', '2026-01-01');
@@ -112,7 +132,7 @@ CREATE PARTITION SCHEME ps_OrderDate
     AS PARTITION pf_OrderDate ALL TO ([PRIMARY]);
 
 -- 3) Create/align the table & its indexes ON the scheme(partition column)
-CREATE TABLE dbo.[Order] (OrderID bigint, OrderDate date NOT NULL, ...)
+CREATE TABLE dbo.[MyDB_Order] (OrderID bigint, OrderDate date NOT NULL, ...)
     ON ps_OrderDate (OrderDate);
 ```
 
@@ -133,13 +153,17 @@ Don't partition small tables for "speed" — a well-indexed unpartitioned table 
 A system-versioned temporal table automatically keeps full row history in a linked **history table**, with two `datetime2` period columns the engine maintains:
 
 ```sql
-CREATE TABLE dbo.Employee (
+-- [SCHEMA CHANGE] Enabling SYSTEM_VERSIONING creates/links a history table and changes write
+-- behavior for every UPDATE/DELETE thereafter. On a NEW table this is metadata-only; turning it
+-- ON for an EXISTING table validates/aligns history and takes a Sch-M lock — confirm target DB
+-- (SELECT DB_NAME()) and use a maintenance window. Rollback = SET (SYSTEM_VERSIONING = OFF).
+CREATE TABLE dbo.[MyDB_Employee] (
     EmployeeID int PRIMARY KEY,
     Salary     decimal(10,2) NOT NULL,
     ValidFrom  datetime2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL,
     ValidTo    datetime2 GENERATED ALWAYS AS ROW END   HIDDEN NOT NULL,
     PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo)
-) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.EmployeeHistory));
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.[MyDB_EmployeeHistory]));
 ```
 
 Query any past state with `FOR SYSTEM_TIME` (`AS OF`, `FROM..TO`, `BETWEEN`, `CONTAINED IN`, `ALL`):
@@ -170,7 +194,10 @@ Compression applies per table/index/partition — a common pattern is `PAGE`/`CO
 In-Memory OLTP keeps table rows in memory with lock-free, latch-free **MVCC (optimistic multi-versioning)** access — eliminating latch/lock hot spots and enabling extreme insert/lookup throughput. Tables require a **memory-optimized filegroup** and at least one index (see `indexing.md` §11 for hash vs. range).
 
 ```sql
-CREATE TABLE dbo.Session (
+-- [SCHEMA CHANGE] Memory-optimized tables require a memory-optimized FILEGROUP to exist first and
+-- are edition-gated: Enterprise on box / Business Critical|Premium on Azure SQL (NOT available in
+-- Hyperscale). Confirm target DB (SELECT DB_NAME()) and capacity (all data must fit in memory).
+CREATE TABLE dbo.[MyDB_Session] (
     Token   uniqueidentifier NOT NULL,
     UserID  int NOT NULL,
     Expires datetime2 NOT NULL,
@@ -188,6 +215,42 @@ Compile a proc to native machine code (`WITH NATIVE_COMPILATION, SCHEMABINDING` 
 ### Use cases & limits
 - **Good for:** high-contention OLTP (latch/`PAGELATCH` hot spots), high-velocity ingest, transient session/staging data, replacing tempdb-table contention.
 - **Limits/costs:** all data must fit in memory (size carefully + leave headroom; out-of-memory aborts transactions); feature restrictions versus disk tables have narrowed each release but still exist; cross-feature interactions (e.g. with some replication/CDC) vary by version — verify against the target build.
+
+---
+
+## 10. Indexed (Materialized) Views
+
+An **indexed view** materializes a view's result by building a **unique clustered index** on it; the engine then keeps it current automatically on every base-table write. Use it for expensive pre-joins/pre-aggregations read far more often than written.
+
+```sql
+-- [SCHEMA CHANGE] Creating the clustered index on the view is size-of-data (materializes every row)
+-- and takes Sch-M locks on the referenced tables; confirm target DB and use a maintenance window.
+CREATE VIEW dbo.[MyDB_vSalesByDay] WITH SCHEMABINDING AS
+    SELECT SalesDate, COUNT_BIG(*) AS Cnt, SUM(Amount) AS TotalAmount
+    FROM dbo.[MyDB_Sales]            -- two-part (schema.table) names are mandatory under SCHEMABINDING
+    GROUP BY SalesDate;
+CREATE UNIQUE CLUSTERED INDEX IXC_vSalesByDay ON dbo.[MyDB_vSalesByDay] (SalesDate);
+```
+
+Key rules and costs:
+- **`WITH SCHEMABINDING` is mandatory**, and so is `COUNT_BIG(*)` whenever the view aggregates. References must be two-part (`schema.object`) names.
+- **Disallowed constructs:** outer joins, `UNION`/`UNION ALL`, subqueries/CTEs/derived tables, `DISTINCT`, `TOP`, `HAVING`, `MIN`/`MAX` (in an aggregating view), non-deterministic expressions, and `SUM` over a nullable column. The base tables' relevant `SET` options must match ANSI defaults.
+- **Enterprise auto-matching:** on **Enterprise (also Developer/Evaluation; and the Azure SQL DB/MI engine)** the optimizer can **automatically substitute** the indexed view into queries that didn't name it. On **Standard**, you must reference the view *and* add the **`NOEXPAND`** hint (`FROM dbo.vSalesByDay WITH (NOEXPAND)`) for the engine to read the materialized data instead of expanding the definition.
+- **Maintenance cost:** every base-table DML must also update the materialized index synchronously — great for read-heavy/append-light data, a write tax on hot OLTP tables.
+
+---
+
+## 11. Platform Feature Surface & Edition Gates (engineering)
+
+Schema-design features are sharply edition- and platform-gated — verify the current surface on Microsoft Learn for your build/tier before committing a design:
+
+- **In-Memory OLTP** — Enterprise/Developer on box; **Business Critical | Premium** on Azure SQL DB/MI; **not available in Hyperscale** at all.
+- **Online index create/rebuild (`ONLINE = ON`)** and **RESUMABLE** rebuild — **Enterprise-only** on box (also Developer/Evaluation; the Azure SQL DB/MI engine supports online). Standard rebuilds are **OFFLINE** (Sch-M lock) — design maintenance around `REORGANIZE` or windows (see `indexing.md` §8).
+- **Indexed-view automatic matching** — Enterprise-only; Standard needs `NOEXPAND` (§10).
+- **Partitioning** — **all editions since SQL Server 2016 SP1** (previously Enterprise-only); a portability win.
+- **Data compression** (`ROW`/`PAGE`/columnstore) — all editions since 2016 SP1.
+- **Temporal / system-versioned tables** — all editions, 2016+.
+- **Managed-platform constraints:** **AWS RDS for SQL Server** and **Google Cloud SQL for SQL Server** block features that need OS/filesystem access (e.g. FILESTREAM/FileTable, some In-Memory filegroup operations, certain CLR/agent surfaces) and gate edition by the instance class you provision — confirm the feature list for the managed offering, not just the engine edition. Cloud details and migration sit in **`sqlserver-cloud`**.
 
 ---
 

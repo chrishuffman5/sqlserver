@@ -41,12 +41,17 @@ Discovery and business-case tooling for a **portfolio** — inventories on-prem 
 | **Log Replay Service (LRS)** | **MI** | Cutover only | Continuously restore a full+log backup chain from Blob onto MI; manual cutover. The "no MI link available" near-zero alternative. |
 | **Transactional replication** | Azure SQL DB (subscriber), MI, VM | Near-zero | Publisher stays on-prem; subscriber in cloud. Good for phased/partial moves and table subsets. |
 | **Distributed AG** | **MI**, SQL-on-VM | Near-zero | Stretch an existing on-prem AG to a cloud replica, sync, then fail over. Needs an existing AG. |
-| **Detach/attach, import/export wizard, SSIS, bcp** | VM (attach), any (data tools) | Varies | Tactical/partial; attach only works on the box engine (VM), not PaaS. |
+| **Native backup/restore to S3** | **AWS RDS** (also EC2) | Outage = restore time | `rds_backup_database` / `rds_restore_database` (via an **option group**) move native `.bak` files to/from Amazon S3 — the primary path into/out of RDS. EC2 is the box engine (any on-prem method). |
+| **AWS DMS** (full-load + CDC) | **AWS RDS**, EC2 | **Minimal** (online CDC) | Managed migration/replication service; full load then change-data-capture for low-downtime cutover. Heterogeneous-capable; for homogeneous SQL→SQL, S3 backup/restore is often simpler. |
+| **GCP Database Migration Service (DMS)** | **Cloud SQL for SQL Server** | Varies (continuous option) | Google's managed migration service; can do continuous migration from on-prem/other clouds into Cloud SQL. Cloud SQL also supports import from a SQL `.bak` in Cloud Storage. |
+| **Detach/attach, import/export wizard, SSIS, bcp** | VM/EC2 (attach), any (data tools) | Varies | Tactical/partial; attach only works on the box engine (VM/EC2), not PaaS. |
 
 ### Choosing by target
 - **→ Azure SQL Database:** BACPAC (small/static) or **Azure DMS online** (larger, low downtime), or transactional replication for phased. No native backup/restore — the engine won't accept a `.bak`.
 - **→ Managed Instance:** **MI link** (lowest downtime, 2022+), **native backup/restore to URL** (simplest), **LRS** (chain restore), **Azure DMS**, or **distributed AG**.
 - **→ SQL on VM:** **backup/restore to URL**, distributed AG, log shipping, or Azure DMS — it's the box engine, so almost any on-prem method works.
+- **→ AWS RDS for SQL Server:** **native backup/restore to/from S3** (`rds_backup_database` / `rds_restore_database` via an option group — simplest for homogeneous SQL→SQL), or **AWS DMS** (full-load + CDC) for lower-downtime cutover. RDS won't accept a restore to local disk. (RDS **Custom** / **EC2** are the box engine and take any on-prem method.)
+- **→ Google Cloud SQL for SQL Server:** **GCP Database Migration Service** (continuous migration) or **import a `.bak` from Cloud Storage**; export back out the same way. No OS/local-disk restore path.
 
 ---
 
@@ -80,7 +85,7 @@ Resolve these *before* cutover — they are the features DMA flags.
 **Block / restrict Azure SQL Managed Instance:**
 - FILESTREAM/FileTable; buffer pool extension; most trace flags.
 - Unsupported `sp_configure` options; certain replication roles.
-- **Instance/tempdb collation is fixed** — a non-`SQL_Latin1_General_CP1_CI_AS` instance collation needs special handling.
+- **Instance (server) collation is set at MI creation and immutable after** (`tempdb` follows it; default is `SQL_Latin1_General_CP1_CI_AS`) — match the source instance collation when you create the MI, or plan special handling.
 - Cross-instance Service Broker; OS-dependent features (`xp_cmdshell` to host, file shares).
 
 **Block AWS RDS / Cloud SQL:**
@@ -116,7 +121,7 @@ A migration isn't done at cutover — validate:
 | OS access, FILESTREAM, full feature set, version pinning | **SQL on Azure VM** (or RDS Custom on AWS) |
 | SQL Agent, cross-DB queries, CLR, Service Broker, linked servers (lift-and-shift an instance) | **Azure SQL Managed Instance** |
 | A single/independent cloud-native database, elastic scale, serverless economics | **Azure SQL Database** |
-| >4 TB, near-instant backup/restore, read scale-out | **Azure SQL Database — Hyperscale** |
+| >4 TB (up to 128 TB; verify the current limit on Microsoft Learn), near-instant backup/restore, read scale-out | **Azure SQL Database — Hyperscale** |
 | Many small multi-tenant DBs peaking at different times | **Azure SQL DB — Elastic Pool** |
 | Least-effort managed SQL on AWS / GCP | **AWS RDS** / **Cloud SQL** |
 

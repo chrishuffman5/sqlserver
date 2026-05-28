@@ -17,11 +17,15 @@ MI is deployed **inside your virtual network** — it is private by default, not
 
 ## 2. Service Tiers
 
-| Tier | Storage / architecture | HA | Max size | When to use |
+| Tier | Storage / architecture | HA | Max instance storage* | When to use |
 |---|---|---|---|---|
-| **General Purpose (GP)** | Compute separated from **remote** Azure premium storage (one file per DB file) | Built-in: failover reattaches storage to a new node; backed by Azure storage redundancy | up to 16 TB (size depends on vCores/file count) | Most workloads; balanced cost; IO latency higher than BC |
-| **Business Critical (BC)** | **Local SSD**, built-in **Always On AG** (4 replicas) | Highest; includes one **free readable secondary**; in-memory OLTP supported; zone-redundant option | up to 16 TB | Low-latency IO, high availability, read offload |
-| **Next-gen General Purpose** | Re-architected GP with improved IOPS/throughput and more flexible storage scaling | Same model as GP | larger limits | New GP deployments wanting better performance/scaling levers |
+| **General Purpose (GP)** | Compute separated from **remote** Azure premium storage (one file per DB file) | Built-in: failover reattaches storage to a new node; backed by Azure storage redundancy | up to 16 TB (classic GP) | Most workloads; balanced cost; IO latency higher than BC |
+| **Business Critical (BC)** | **Local SSD**, built-in **Always On AG** (4 replicas) | Highest; includes one **free readable secondary**; in-memory OLTP supported; zone-redundant option | up to 16 TB (premium-series, enough vCores, supported region); Standard-series caps at 4 TB | Low-latency IO, high availability, read offload |
+| **Next-gen General Purpose** | Re-architected GP: **flexible storage scaling**, **separately provisioned IOPS** (above a built-in baseline), and a **changed IO billing model** (you pay for IOPS over the free quota) | Same model as GP | up to 32 TB | New GP deployments wanting better performance/scaling levers and pay-for-what-you-provision IO |
+
+\* **Max storage scales with vCores and hardware generation, and is not a flat number.** On BC, 16 TB requires premium-series (or memory-optimized premium-series) hardware with a high-enough vCore count in a region that offers it — smaller regions or vCore counts cap at 5.5 TB (Standard-series BC tops out at 4 TB). Per-tier/per-vCore tables move; **verify the current limits on Microsoft Learn** ([MI resource limits](https://learn.microsoft.com/en-us/azure/azure-sql/managed-instance/resource-limits)) for your hardware generation and region.
+
+**Next-gen GP, concretely:** storage scales flexibly (in 32-GB multiples), IOPS are provisioned separately — every instance gets a built-in baseline (~3 IOPS per GB of reserved storage, min ~300) and you can buy additional IOPS up to a per-vCore cap; throughput scales with IOPS (~IOPS/30 MB/s). Unlike classic GP/BC, **IOPS over the free quota are billed** — model that when costing it.
 
 Choose **BC** when you need local-SSD latency, the free readable secondary, or In-Memory OLTP. Choose **GP / Next-gen GP** for cost-balanced general workloads.
 
@@ -118,8 +122,9 @@ Even with near-full parity, these gaps remain (the common DMA blockers for an MI
 - **`sp_configure`** — only a limited subset of options is settable.
 - **Cross-instance Service Broker** routes (Broker works only *within* the instance).
 - **Replication:** MI can be a subscriber/publisher in limited topologies; some configurations (e.g. merge replication, certain publisher roles) are restricted.
-- **No OS access**, no `xp_cmdshell` to the host filesystem in the usual sense, no Windows file shares, no PolyBase (historically; check current support), no Stretch DB, no Machine Learning Services (R/Python) historically.
-- **Database-level collation** is flexible, but the **instance/`tempdb` collation is fixed at creation** (`SQL_Latin1_General_CP1_CI_AS`) — a mismatch with a source instance collation is a known migration gotcha.
+- **No OS access**, no `xp_cmdshell` to the host filesystem in the usual sense, no Windows file shares, no Stretch DB.
+- **PolyBase / data virtualization** and **Machine Learning Services (R/Python)** **are now supported on MI** (this changed — they were historically unavailable; on MI, ML Services supports only R/Python, not external Java). Re-verify the current surface on Microsoft Learn for your scenario rather than assuming the old "not supported" answer.
+- **Instance (server) collation** is **chosen at creation and immutable thereafter** — the **default** (not a forced value) is `SQL_Latin1_General_CP1_CI_AS`, and **`tempdb` follows the instance collation**. Database-level collation remains flexible. To avoid the classic migration gotcha, match the source instance's collation (`SERVERPROPERTY('Collation')`) when you create the MI; a mismatch can throw unexpected query errors after migration.
 - Backup/restore are **automatic** — you can't manage the chain or restore arbitrary external .bak files except `RESTORE ... FROM URL`.
 
 ---
