@@ -3,7 +3,7 @@ name: sqlserver-security
 description: "SQL Server security and authentication end-to-end: authentication modes (Windows/Active Directory with Kerberos and SPNs, SQL authentication, Microsoft Entra ID / Azure AD, certificate and contained-database auth), authorization (principals, securables, the permission hierarchy, fixed and user-defined roles, schemas, least privilege), encryption (TDE, Always Encrypted with secure enclaves, TLS in transit, backup and cell-level encryption), Row-Level Security, Dynamic Data Masking, SQL Server Audit, ledger, and surface-area hardening. WHEN: \"authentication\", \"Windows auth\", \"SQL auth\", \"mixed mode\", \"Entra ID\", \"Azure AD auth\", \"Kerberos\", \"SPN\", \"double hop\", \"login\", \"orphaned user\", \"permission\", \"GRANT\", \"DENY\", \"role\", \"least privilege\", \"sysadmin\", \"sa account\", \"TDE\", \"Always Encrypted\", \"secure enclave\", \"TLS\", \"encrypt connection\", \"row-level security\", \"dynamic data masking\", \"SQL Server Audit\", \"ledger\", \"hardening\", \"xp_cmdshell\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Security & Authentication

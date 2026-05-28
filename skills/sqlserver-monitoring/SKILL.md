@@ -3,7 +3,7 @@ name: sqlserver-monitoring
 description: "SQL Server performance monitoring and diagnostics: wait-statistics methodology, Dynamic Management Views (DMVs), Query Store, Extended Events, blocking and deadlock analysis, performance counters, baselining, and health checks. WHEN: \"slow\", \"performance problem\", \"wait stats\", \"wait type\", \"DMV\", \"Query Store\", \"Extended Events\", \"XEvents\", \"blocking\", \"deadlock\", \"high CPU\", \"PAGEIOLATCH\", \"CXPACKET\", \"PLE\", \"page life expectancy\", \"baseline\", \"perfmon counter\", \"sp_whoisactive\", \"troubleshoot performance\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Monitoring & Diagnostics

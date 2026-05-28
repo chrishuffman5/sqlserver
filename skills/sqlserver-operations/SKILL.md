@@ -3,7 +3,7 @@ name: sqlserver-operations
 description: "SQL Server day-to-day operations and core DBA tasks: backup and recovery strategy, restore testing, recovery models, point-in-time recovery, index and statistics maintenance, DBCC CHECKDB and corruption handling, SQL Agent jobs/alerts/Database Mail, patching and cumulative-update strategy, and space/capacity management. WHEN: \"backup\", \"restore\", \"recovery model\", \"point-in-time\", \"RPO\", \"RTO\", \"DBCC CHECKDB\", \"corruption\", \"maintenance plan\", \"Ola Hallengren\", \"index maintenance\", \"update statistics\", \"SQL Agent job\", \"alert\", \"Database Mail\", \"cumulative update\", \"patch\", \"disk space\", \"shrink\", \"VLF\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Operations

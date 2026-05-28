@@ -3,7 +3,7 @@ name: sql-server
 description: "Comprehensive Microsoft SQL Server expert and router covering the full database-management lifecycle across versions 2016-2025 and the cloud (Azure SQL Database, Azure SQL Managed Instance, SQL on Azure VM, AWS RDS, Google Cloud SQL). Routes to specialized skills for operations, monitoring, HA/clustering, engineering, infrastructure, cloud, security, and offline DuckDB-powered analysis & recommendations (advisor). WHEN: \"SQL Server\", \"MSSQL\", \"T-SQL\", \"SSMS\", \"sqlcmd\", \"DBA\", \"database administration\", general or cross-cutting SQL Server questions, or when the specific management domain is unclear."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Expert (Router)

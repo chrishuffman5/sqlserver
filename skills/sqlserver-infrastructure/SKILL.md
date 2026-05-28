@@ -3,7 +3,7 @@ name: sqlserver-infrastructure
 description: "SQL Server instance and platform infrastructure: hardware sizing, memory configuration (max/min server memory, Lock Pages in Memory), MAXDOP and cost threshold for parallelism, NUMA, tempdb configuration, instant file initialization, trace flags, storage layout and disk subsystem, OS settings, deployment on Windows/Linux/containers, and network/protocol/port configuration. WHEN: \"max server memory\", \"min server memory\", \"MAXDOP\", \"cost threshold for parallelism\", \"NUMA\", \"soft-NUMA\", \"tempdb configuration\", \"trace flag\", \"startup parameter\", \"instant file initialization\", \"Lock Pages in Memory\", \"instance configuration\", \"sp_configure\", \"SQL Server on Linux\", \"mssql-conf\", \"SQL Server container\", \"Docker\", \"storage layout\", \"sizing\", \"TCP 1433\", \"port\", \"protocol\", \"SQL Browser\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Infrastructure

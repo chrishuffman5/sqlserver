@@ -3,7 +3,7 @@ name: sqlserver-cloud
 description: "SQL Server cloud offerings and migration: Azure SQL Database (DTU/vCore, elastic pools, serverless, Hyperscale), Azure SQL Managed Instance, SQL Server on Azure VM, AWS RDS for SQL Server, and Google Cloud SQL — including feature-parity differences, geo-replication, auto-failover groups, and migration tooling (Data Migration Assistant, Azure DMS, Managed Instance link, log replay, BACPAC, backup/restore to URL). WHEN: \"Azure SQL\", \"Azure SQL Database\", \"Managed Instance\", \"SQL MI\", \"Hyperscale\", \"elastic pool\", \"serverless SQL\", \"DTU\", \"vCore\", \"SQL Server on Azure VM\", \"SQL IaaS\", \"AWS RDS SQL Server\", \"RDS\", \"Cloud SQL\", \"geo-replication\", \"failover group\", \"DMA\", \"Azure DMS\", \"MI link\", \"cloud migration\", \"BACPAC\", \"PaaS SQL\", \"which Azure SQL\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server in the Cloud
