@@ -13,7 +13,7 @@ For AG specifics see `availability-groups.md`; for migrating mirroring → AG an
 
 ## A1. What It Is
 
-Database mirroring maintains a **single hot standby copy of one database** by shipping transaction-log records from a **principal** to a **mirror** over a database-mirroring endpoint. It is per-database (not instance, not a group). **Deprecated since SQL Server 2012** — Microsoft recommends Always On AGs (or Basic AG on Standard) instead — but it is still removed-in-some-future-version, present through 2022/2025 builds and very common in legacy estates.
+Database mirroring maintains a **single hot standby copy of one database** by shipping transaction-log records from a **principal** to a **mirror** over a database-mirroring endpoint. It is per-database (not instance, not a group). **Deprecated since SQL Server 2012** — Microsoft recommends Always On AGs (or Basic AG on Standard) instead, and the feature is slated for removal in a future version — but it is still present through current (2022/2025) builds and very common in legacy estates, so you must operate and migrate it.
 
 ## A2. Roles
 
@@ -72,14 +72,15 @@ Send/redo throughput comes from the **`SQLServer:Database Mirroring`** performan
 
 ### Failover commands (templates — run deliberately)
 ```sql
--- Planned manual failover (sync, no data loss) — run on the PRINCIPAL:
--- ALTER DATABASE [AppDB] SET PARTNER FAILOVER;
+-- [CONFIG CHANGE] Planned manual failover (sync, no data loss) — run on the PRINCIPAL:
+-- ALTER DATABASE [CONFIRM_DB] SET PARTNER FAILOVER;
 
--- Forced failover (async / partner unreachable, POSSIBLE DATA LOSS) — run on the MIRROR:
--- ALTER DATABASE [AppDB] SET PARTNER FORCE_SERVICE_ALLOW_DATA_LOSS;
+-- [DATA-LOSS RISK] Forced failover (async / partner unreachable) CAN LOSE COMMITTED TRANSACTIONS — run on the MIRROR.
+-- Complete the dr-planning.md §5 pre-flight checklist (state, approval, backups, app freeze, owner) first. TEMPLATE ONLY.
+-- ALTER DATABASE [CONFIRM_DB] SET PARTNER FORCE_SERVICE_ALLOW_DATA_LOSS;
 
--- Resume a suspended session:
--- ALTER DATABASE [AppDB] SET PARTNER RESUME;
+-- [CONFIG CHANGE] Resume a suspended session:
+-- ALTER DATABASE [CONFIRM_DB] SET PARTNER RESUME;
 ```
 
 ## A6. Migrating Mirroring → Always On AG
@@ -103,7 +104,7 @@ The endpoint is the network door log blocks travel through. **One database-mirro
 | **`DATABASE_MIRRORING`** | Transport for mirroring **and** Always On AGs | **Primary focus** |
 | `SERVICE_BROKER` | Service Broker messaging | Mentioned for completeness |
 | `TSQL` (default) | Client connections (TDS) | Always present; not HA |
-| `SOAP` | Legacy web services (removed in 2012+) | Historical only |
+| `SOAP` | Legacy web services (removed in SQL Server 2012) | Historical only |
 
 Only **one** `DATABASE_MIRRORING` endpoint may exist per instance. Both mirroring partners/witness and all AG replicas connect through it.
 
@@ -169,9 +170,11 @@ Use certificates when there is **no shared AD trust** — different domains, wor
 
 ### Step 1 — On EACH instance: create a master key + a local endpoint certificate
 ```sql
+-- [SECURITY CHANGE] Endpoint master key + identity certificate. Run on EACH replica; confirm the instance.
 USE master;
--- Database master key (protects the cert's private key). Use a strong, stored secret.
-CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'Str0ng!MasterKeyPwd';
+-- Database master key (protects the cert's private key).
+-- Secret: source from a secret manager; never commit; avoid T-SQL history exposure; rotate any value copied from docs.
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>';
 
 -- This instance's identity certificate (private key stays here).
 CREATE CERTIFICATE [Node1_Cert]
@@ -186,6 +189,7 @@ Repeat on Node2 (`Node2_Cert`), Node3, etc. Each instance keeps its own private 
 
 ### Step 2 — Create the endpoint using the LOCAL certificate
 ```sql
+-- [CONFIG CHANGE] Creates/starts the DBM/AG endpoint on this instance (TCP 5022). Run deliberately on each replica.
 CREATE ENDPOINT [Hadr_endpoint]
     STATE = STARTED
     AS TCP (LISTENER_PORT = 5022)
@@ -199,8 +203,10 @@ On Node2 the endpoint uses `AUTHENTICATION = CERTIFICATE [Node2_Cert]`, etc.
 ### Step 3 — On EACH instance: import the OTHER instances' public certs and map a login
 For Node1 to accept Node2, on **Node1** create a login + user, import Node2's public cert under that user, then grant CONNECT:
 ```sql
+-- [SECURITY CHANGE] Partner login/user + peer public-cert import + endpoint CONNECT grant. Least-privilege; cert does the auth.
 -- On NODE1, set up access for NODE2:
-CREATE LOGIN [Node2_Login] WITH PASSWORD = N'An0ther!Str0ngPwd';   -- placeholder; never actually used to log in
+-- Secret: source from a secret manager; never commit; rotate any value copied from docs. The cert does the auth.
+CREATE LOGIN [Node2_Login] WITH PASSWORD = N'<generate-32+char-random-secret>';   -- placeholder; never actually used to log in (cert-mapped)
 CREATE USER  [Node2_User]  FOR LOGIN [Node2_Login];
 
 CREATE CERTIFICATE [Node2_Cert]

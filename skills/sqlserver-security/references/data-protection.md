@@ -20,6 +20,8 @@ RLS restricts **which rows** a principal can read or write, enforced by the engi
 
 ### Pattern
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), use placeholder names, build & test in a scratch DB
+-- (a policy with STATE = ON takes effect immediately for ALL sessions — verify the predicate first).
 -- 1. Predicate function: schema-bound inline TVF, returns 1 row when allowed
 CREATE FUNCTION rls.fn_tenant_predicate(@TenantId int)
 RETURNS TABLE WITH SCHEMABINDING AS
@@ -32,6 +34,7 @@ CREATE SECURITY POLICY rls.TenantPolicy
 ADD FILTER PREDICATE rls.fn_tenant_predicate(TenantId) ON dbo.Orders,
 ADD BLOCK  PREDICATE rls.fn_tenant_predicate(TenantId) ON dbo.Orders AFTER INSERT
 WITH (STATE = ON);
+-- Rollback: ALTER SECURITY POLICY rls.TenantPolicy WITH (STATE = OFF);  (or DROP the policy)
 ```
 
 ### The SESSION_CONTEXT pattern
@@ -67,6 +70,8 @@ DDM **rewrites column values in query output** for unprivileged users — the st
 | `random(low, high)` | a random number in range | Numeric noise |
 
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), use placeholder names, test in a scratch DB.
+-- ADD MASKED is a metadata-only change (no data rewrite); remove with ALTER COLUMN ... DROP MASKED.
 ALTER TABLE dbo.Customers
 ALTER COLUMN Email  ADD MASKED WITH (FUNCTION = 'email()');
 ALTER TABLE dbo.Customers
@@ -90,6 +95,7 @@ SELECT 1 WHERE EXISTS (SELECT 1 FROM dbo.Emp
 ### Granular UNMASK (2022+)
 Pre-2022, `UNMASK` was database-wide (all or nothing). **2022+** allows `GRANT UNMASK` at **schema, table, or column** scope, so you can let a role see real values for *some* columns only:
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), use placeholder names. (UNMASK reveals plaintext — grant narrowly; REVOKE to roll back.)
 GRANT UNMASK ON dbo.Customers(Email) TO support_role;   -- 2022+ column-level
 ```
 
@@ -100,9 +106,12 @@ GRANT UNMASK ON dbo.Customers(Email) TO support_role;   -- 2022+ column-level
 SQL Server can **label columns** with sensitivity (e.g., Confidential, GDPR) and information type — metadata that drives auditing, reporting, and (in Azure) policy. It does not restrict access by itself; it powers governance and surfaces what to protect.
 
 ```sql
+-- [SECURITY CHANGE] illustrative metadata label; confirm DB via DB_NAME(), use placeholder names. (Remove with DROP SENSITIVITY CLASSIFICATION.)
 ADD SENSITIVITY CLASSIFICATION TO dbo.Customers.SSN
 WITH (LABEL = 'Highly Confidential', INFORMATION_TYPE = 'National ID', RANK = HIGH);
+```
 
+```sql
 -- Inventory current classifications (read-only)
 SELECT OBJECT_SCHEMA_NAME(c.object_id) AS sch, OBJECT_NAME(c.object_id) AS tbl,
        col.name AS column_name, c.label, c.information_type, c.rank_desc
@@ -123,14 +132,17 @@ Classifications integrate with **SQL Server Audit** (the data-sensitivity inform
 | **Updatable ledger table** | Allowed, but versioned | The table + a hidden **history table** + a **ledger view** that unions current and historical rows with transaction/sequence metadata |
 | **Append-only ledger table** | **Inserts only** (no update/delete) | The table itself is the immutable record (e.g., audit logs) |
 
-```sql
--- Append-only ledger table (immutable insert log)
-CREATE TABLE dbo.AccessLog (Id int IDENTITY, UserName sysname, AtUtc datetime2)
-WITH (LEDGER = ON (APPEND_ONLY = ON));
+> **[DATA-LOSS RISK] — IRREVERSIBLE.** Creating a ledger table (or a ledger-enabled database) **cannot be undone**: a ledger table **cannot be converted back** to an ordinary table, append-only ledger tables **reject UPDATE/DELETE forever**, and (2022+) `ALTER DATABASE ... SET LEDGER = ON` is a one-way switch for the whole database. This is a design decision, not a routine DDL. Pre-flight: (1) confirm you are on the intended instance/DB (`SELECT @@SERVERNAME, DB_NAME()`); (2) obtain documented business/compliance approval that immutability is required; (3) confirm storage budget for history + digests; (4) name the owner of digest generation/verification and (for auto-storage) the immutable Azure storage/Confidential Ledger target. The fence below is a **non-runnable template** — uncomment and substitute confirmed names only after the checklist passes.
 
--- Updatable ledger table (auto-creates history + ledger view)
-CREATE TABLE dbo.Balances (AccountId int PRIMARY KEY, Amount money)
-WITH (LEDGER = ON);
+```sql
+-- [DATA-LOSS RISK] IRREVERSIBLE — runbook template, NOT runnable as-is. Substitute [CONFIRM_DB]/[CONFIRM_TABLE].
+-- Append-only ledger table (immutable insert log — UPDATE/DELETE blocked permanently)
+-- CREATE TABLE [CONFIRM_TABLE]_AccessLog (Id int IDENTITY, UserName sysname, AtUtc datetime2)
+-- WITH (LEDGER = ON (APPEND_ONLY = ON));
+
+-- Updatable ledger table (auto-creates a hidden history table + ledger view; cannot revert to a plain table)
+-- CREATE TABLE [CONFIRM_TABLE]_Balances (AccountId int PRIMARY KEY, Amount money)
+-- WITH (LEDGER = ON);
 ```
 
 ### Digests & verification

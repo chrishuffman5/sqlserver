@@ -26,6 +26,8 @@ There is a **lightweight** management mode (no agent in the guest) and a **full*
 - **Data files:** enable **read caching** (ReadOnly host cache) on the data disks.
 - **Log file:** **no caching** (None) on the log disk — write-heavy and latency-sensitive; caching hurts and risks correctness on some configs.
 - **tempdb:** place on the VM's **local/ephemeral SSD** (the temporary `D:`/resource disk) where the VM offers one — it's fast and free, and tempdb is recreated on restart anyway.
+  - **Ephemeral-disk caveat:** the local/temp disk is **wiped when the VM deallocates, stops, or relocates to a new host** — the tempdb folder *and its NTFS permissions* vanish. SQL Server then **fails to start** because the tempdb path doesn't exist. Mitigate by recreating the folder (with the right permissions) at boot **before** the engine starts: the **SQL IaaS Agent extension** automates this for Marketplace SQL VM images; for a manually installed instance, set the SQL Server + Agent services to **manual** start and run a startup-triggered scheduled task (PowerShell) that creates the folder and then starts the services. See Microsoft Learn, "Place tempdb on Ephemeral Storage."
+  - **tempdb metadata contention:** for metadata-heavy tempdb workloads, consider **memory-optimized tempdb metadata** (`ALTER SERVER CONFIGURATION SET MEMORY_OPTIMIZED TEMPDB_METADATA = ON;`, 2019+; requires a restart) — a `sqlserver-infrastructure` topic; tag it as a `[CONFIG CHANGE]` if you script it.
 - **Stripe multiple disks** into a **Storage Spaces** pool (Windows) to aggregate IOPS/throughput beyond a single disk's cap; size the pool to your IOPS target, not just capacity.
 - Pick a **VM size** whose uncached/cached IOPS and throughput limits exceed your disk aggregate — the VM cap, not the disk, is often the real ceiling.
 - Format data/log volumes with **64 KB allocation unit size**; enable **Instant File Initialization** and **Lock Pages in Memory**; set **max server memory** leaving headroom for the OS (these are box-product tunings — see `sqlserver-infrastructure`).
@@ -95,7 +97,7 @@ Use Cloud SQL when the organization is GCP-resident and wants least-effort manag
 Choose **SQL on a VM / RDS Custom / self-managed** (IaaS) when you need any of:
 
 - **OS-level access** — third-party backup/monitoring agents, custom scripts, Windows scheduled tasks, host file access.
-- **Features PaaS doesn't support** — FILESTREAM/FileTable, full PolyBase, every trace flag, unusual `sp_configure`, cross-instance MSDTC, Stretch DB, ML Services (R/Python), specific replication topologies.
+- **Features PaaS doesn't support** — FILESTREAM/FileTable, every trace flag, unusual `sp_configure`, cross-instance MSDTC, Stretch DB, specific replication topologies. (Note: **PolyBase/data virtualization and ML Services (R/Python) are now available on MI** — don't assume the old "PaaS can't do it" answer; re-verify on Microsoft Learn. Full external-language support, e.g. Java, and the full PolyBase surface still favor the box engine.)
 - **Full version/patch control** — pin a build, delay CUs, run an out-of-support version during migration.
 - **Specialized configuration** — custom storage layout, NUMA tuning, soft-NUMA, dedicated tempdb hardware, In-Memory OLTP at extreme scale.
 - **Existing tooling/automation** built around an instance you can fully control.

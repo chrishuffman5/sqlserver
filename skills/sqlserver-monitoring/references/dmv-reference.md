@@ -6,6 +6,8 @@ Applies to SQL Server 2016–2025. Version notes are inline. On Azure SQL Databa
 
 Permissions: most require `VIEW SERVER STATE` (box/MI) or `VIEW DATABASE STATE` (Azure SQL DB). Reading plan/text functions additionally needs the request to be visible to you.
 
+> **Least-privilege monitoring logins (2022+).** SQL Server 2022 split the broad `VIEW SERVER STATE` into granular **`VIEW SERVER PERFORMANCE STATE`** (the performance/diagnostic DMVs this skill uses) and **`VIEW SERVER SECURITY STATE`** (the security-related ones), with matching fixed server roles (`##MS_ServerPerformanceStateReader##`, `##MS_ServerSecurityStateReader##`) and database-scoped equivalents (`VIEW DATABASE PERFORMANCE STATE` / `VIEW DATABASE SECURITY STATE`). Grant a monitoring account `VIEW SERVER PERFORMANCE STATE` instead of full `VIEW SERVER STATE` so it can read waits/plans/grants without exposing logins, permissions, or cryptographic metadata. Note: on 2022+, a few performance DMVs now require the *performance* permission specifically, so a login with only legacy `VIEW SERVER STATE` may still hit permission errors. Available on SQL Server 2022+ and Azure SQL; verify exact permission/role names and per-DMV requirements on Microsoft Learn for your build. Granting these is a `[SECURITY CHANGE]` — see `sqlserver-security`.
+
 ---
 
 ## 1. Execution & Performance
@@ -25,6 +27,21 @@ Permissions: most require `VIEW SERVER STATE` (box/MI) or `VIEW DATABASE STATE` 
 | `sys.dm_exec_sql_text(handle)` | DMF | SQL batch text for a sql/plan handle |
 | `sys.dm_exec_input_buffer(spid, req)` (2016+) | DMF | The literal input buffer of a session (replaces `DBCC INPUTBUFFER`) |
 | `sys.dm_exec_query_stats_xml` / `sys.dm_exec_query_plan_stats` (2019+) | DMF | Last *actual* plan (runtime stats) when "last query plan stats" is on |
+| `sys.dm_exec_query_profiles` | Instance | **Live per-operator actual row counts** for *currently running* queries (powers Live Query Statistics) |
+
+**Watch a running query in flight.** `sys.dm_exec_query_profiles` returns one row per plan operator for in-progress statements, with the running `row_count` next to `estimate_row_count` — diff them to catch a cardinality blow-up before the query even finishes. It is fed by the **lightweight query profiling infrastructure**: **default-on in SQL Server 2019+** (and Azure SQL DB/MI). On 2016 SP1+/2017 enable it with trace flag **7412** (instance-wide) or a `query_thread_profile` XEvents session; on 2019+ TF 7412 has no effect. Disable per database via the `LIGHTWEIGHT_QUERY_PROFILING` database-scoped configuration. (Verify version/flag details on Microsoft Learn for your build.)
+
+```sql
+-- Live actual-vs-estimated rows per operator for a running session (replace 123)
+SELECT
+    qp.session_id, qp.node_id, qp.physical_operator_name,
+    qp.row_count                                        AS actual_rows_so_far,
+    qp.estimate_row_count                               AS estimated_rows,
+    qp.elapsed_time_ms, qp.cpu_time_ms, qp.logical_read_count
+FROM sys.dm_exec_query_profiles AS qp
+WHERE qp.session_id = 123
+ORDER BY qp.node_id;
+```
 
 **The plan cache is volatile** — it clears on restart, under memory pressure, and on recompiles. For history that survives those events, use Query Store (`references/query-store.md`).
 

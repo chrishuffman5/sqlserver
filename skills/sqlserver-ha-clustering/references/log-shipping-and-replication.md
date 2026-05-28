@@ -54,7 +54,7 @@ If log shipping isn't configured these tables exist but are empty (or, on a clea
 
 ## A6. Failover (manual)
 
-1. If reachable, back up the **tail of the log** on the primary (`WITH NORECOVERY`) and apply it on the secondary for zero loss.
+1. **Tail-log backup — only if the primary is reachable.** If the primary instance is up and the **log file is intact**, back up the tail of the log `WITH NORECOVERY` and apply it on the secondary for zero loss (this leaves the old primary in the `RESTORING` state). If the **data file is lost** but the log is still readable, you cannot take a normal tail-log backup — use `WITH NO_TRUNCATE` (and, for a damaged log, `CONTINUE_AFTER_ERROR`) to capture whatever the log holds; these are best-effort and may still mean some loss. If the primary is gone entirely, skip this step and accept RPO = the last shipped log.
 2. Apply any outstanding copied logs on the secondary.
 3. **Recover** the secondary: `RESTORE DATABASE [DB] WITH RECOVERY;` → it becomes the new primary.
 4. Repoint applications; reconfigure log shipping in the new direction (or re-establish to a fresh secondary).

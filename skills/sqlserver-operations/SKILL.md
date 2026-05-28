@@ -79,6 +79,8 @@ WITH COMPRESSION, CHECKSUM,
 ### Restore sequence and point-in-time
 
 ```sql
+-- [DATA-LOSS RISK] Restore tutorial: WITH REPLACE OVERWRITES the target database.
+-- Confirm you are on the right instance/DB before running. Uses placeholder [MyDB].
 -- 1) Capture the tail of the log first if the DB is still attached and online enough
 --    (preserves the most recent transactions before you overwrite)
 BACKUP LOG [MyDB] TO DISK = N'E:\Backups\MyDB_Tail.trn'
@@ -107,6 +109,7 @@ RESTORE DATABASE [MyDB] WITH RECOVERY;
 
 - **Azure SQL Database / Managed Instance**: backups are **automatic and managed by Microsoft** (full ~weekly, diff ~12–24h, log every 5–10 min). You restore via portal/PowerShell/T-SQL point-in-time within the configured PITR retention (1–35 days) or **Long-Term Retention (LTR)** up to 10 years. You cannot issue `BACKUP DATABASE` to take the operational backup (MI allows `COPY_ONLY` backups to URL for export/migration).
 - **SQL on Azure VM / AWS RDS box-style**: VM is the box product — you own backups (or use Azure Backup / the SQL IaaS extension automated backup). **RDS** takes automated snapshots and supports native `.bak` backup/restore to S3 via `rdsadmin.dbo.rds_backup_database` / `rds_restore_database` — you do **not** run `BACKUP DATABASE` directly.
+- **Google Cloud SQL for SQL Server**: fully managed — automated daily backups plus **point-in-time recovery** driven through the Cloud SQL API/console/gcloud (PITR via transaction-log retention), no OS access and no direct `BACKUP DATABASE` for operational backups. Native `.bak` import/export to a Cloud Storage bucket is available for migration. Like RDS, treat it as a managed platform: confirm the feature surface before prescribing box T-SQL.
 
 ## Maintenance: Index, Statistics, and Integrity
 
@@ -120,11 +123,12 @@ Read `references/maintenance.md` for depth. The operating thresholds:
 | 10–30% | Reorganize (online, resumable, incremental) | `ALTER INDEX … REORGANIZE` |
 | > 30% | Rebuild | `ALTER INDEX … REBUILD` |
 
-Only consider indexes above ~1,000–8,000 pages; fragmentation on tiny indexes is noise. **ONLINE rebuild** is Enterprise on 2016–2019, and available in **Standard from 2019+** for some operations and broadly **2022+**; verify per build. **RESUMABLE** rebuild is **2017+** and resumable *create* is **2019+** — invaluable for big indexes in short maintenance windows.
+Only consider indexes above ~1,000–8,000 pages; fragmentation on tiny indexes is noise. **ONLINE index create/rebuild (`ONLINE = ON`) is Enterprise-only** (also Developer/Evaluation; the Azure SQL DB/MI engine supports it) across **all box versions 2016–2025** — Standard never gained it. On Standard, `REBUILD` is OFFLINE; default to `REORGANIZE` or a scheduled OFFLINE rebuild in an approved window. **RESUMABLE rebuild requires `ONLINE = ON`** (so it is Enterprise-gated on box; available since 2017); resumable *create* is **2019+**. Online rebuild of LOB-containing indexes has been supported since SQL Server 2012. Detect edition before choosing: `SELECT SERVERPROPERTY('EngineEdition'), SERVERPROPERTY('Edition');` — verify on the [Microsoft Learn editions/features page](https://learn.microsoft.com/en-us/sql/sql-server/editions-and-components-of-sql-server-2022) for your build.
 
 ```sql
--- Online, resumable rebuild with a fill factor (Enterprise / 2019+/2022+ per edition)
-ALTER INDEX [IX_Orders_CustomerId] ON dbo.Orders
+-- [PERFORMANCE CHANGE] Online, resumable rebuild (Enterprise/Developer/Evaluation or Azure SQL only).
+-- Confirm DB via DB_NAME(); run in an approved maintenance window. Standard: drop ONLINE/RESUMABLE and use OFFLINE/REORGANIZE.
+ALTER INDEX [IX_Orders_CustomerId] ON [dbo].[Orders]
 REBUILD WITH (ONLINE = ON, RESUMABLE = ON, FILLFACTOR = 90, MAX_DURATION = 60 MINUTES);
 ```
 
@@ -145,9 +149,18 @@ DBCC CHECKDB ([MyDB]) WITH NO_INFOMSGS, ALL_ERRORMSGS, DATA_PURITY;
 1. **Do not panic and do not immediately run REPAIR.** Note the error, the page IDs, and run `DBCC CHECKDB` again to confirm.
 2. **Check the hardware/IO subsystem** — corruption is almost always storage. Look for OS errors 823/824/825 and `msdb.dbo.suspect_pages`.
 3. **Restore from backup** — the correct fix. Use **page-level restore** for a handful of pages (Enterprise online, Standard offline) or a full restore + log roll-forward to recover with zero data loss.
-4. **`REPAIR_ALLOW_DATA_LOSS` is the last resort** — it deallocates corrupt pages, *destroying the data on them*, and requires `SINGLE_USER`. Only when there is no good backup. Take a backup of the corrupt DB first, then repair, then `CHECKDB` again, then reconcile lost rows.
+4. **`REPAIR_ALLOW_DATA_LOSS` is the last resort — [DATA-LOSS RISK]** — it deallocates corrupt pages, *destroying the data on them*, and requires `SINGLE_USER`. Only when there is no good backup. Take a backup of the corrupt DB first, then repair, then `CHECKDB` again, then reconcile lost rows. Some corruption (e.g., certain system-table or PFS/GAM damage) is unrepairable and forces a restore. See the full pre-flight checklist and runbook template in `references/maintenance.md`.
 
 **Ola Hallengren's Maintenance Solution** is the industry standard for box/VM/MI: intelligent `IndexOptimize` (fragmentation- and page-count-aware, reorg/rebuild thresholds, stats), `DatabaseIntegrityCheck`, and `DatabaseBackup`. Prefer it over the GUI Maintenance Plans, which rebuild everything indiscriminately.
+
+### Community tools
+
+For triage and audits, the **Brent Ozar First Responder Kit** (MIT) is the standard free toolset; **sqlserver-monitoring** documents installation and the full proc catalog. Two are directly operational:
+
+- **`sp_BlitzBackups`** — estimates real **RPO/RTO** from `msdb` backup history (read-only). A fast reality check on whether your backup cadence meets the business target.
+- **`sp_DatabaseRestore`** — scripts a multi-file restore sequence and pairs with Ola `DatabaseBackup` output. It is **mutating — treat as [DATA-LOSS RISK]** (it can overwrite a database); review and confirm the target instance/DB before running.
+
+Installing these procs is itself a **[CONFIG CHANGE]** (it creates objects in a DBA/utility database) — review before running in production, consistent with the bundled-script policy. See **sqlserver-monitoring** for the broader read-only `sp_Blitz*` family and Erik Darling's PerformanceMonitor for continuous baselining.
 
 ## SQL Agent, Alerts, and Database Mail
 
@@ -163,9 +176,10 @@ Read `references/agent-jobs.md`. SQL Agent (jobs → steps → schedules, plus o
 (Detail lives in `references/capacity-management.md` alongside servicing.)
 
 - SQL Server moved to a **CU-only servicing model** (no more Service Packs since 2017). CUs ship roughly monthly early in a release, then every two months; they are **cumulative** and now considered as tested as the old SPs — stay reasonably current rather than waiting for an "SP."
+- **GDR vs CU branches.** Each release services on two branches: **GDR** (security/critical fixes only) and **CU** (security + all functional fixes). They are separate update trains — **once you install a CU you are on the CU branch and must stay on CU** (a GDR-only update will no longer apply); only environments that take *no* functional CUs stay on GDR. Pick the branch deliberately per environment.
 - **Always**: read the CU KB for breaking changes/fixes, snapshot/back up first, test in non-prod, and have a rollback plan (CUs are uninstallable; have the prior installer staged).
-- **HA rolling upgrade**: patch secondaries first, fail over, then patch the former primary to minimize downtime — see **sqlserver-ha-clustering** for the AG/FCI rolling-upgrade sequence.
-- **PaaS**: Azure SQL DB/MI are patched by Microsoft (you only control maintenance windows). **RDS** patching is via engine version upgrades you schedule. **Azure VM** can use the SQL IaaS extension's automated patching.
+- **HA rolling upgrade**: patch secondaries first, fail over, then patch the former primary to minimize downtime. The **primary's build must be ≥ every secondary's** during the process (a lower-build primary cannot ship log to a higher-build secondary), so never patch the primary ahead of its secondaries — see **sqlserver-ha-clustering** for the full AG/FCI rolling-upgrade sequence.
+- **PaaS**: Azure SQL DB/MI are patched by Microsoft (you only control maintenance windows). **RDS** patching is via engine version upgrades you schedule. **Google Cloud SQL for SQL Server** is similarly managed — you pick a maintenance window and Google applies minor-version/infra updates; no OS access. **Azure VM** can use the SQL IaaS extension's automated patching.
 
 ## Capacity and Space Management
 
@@ -192,8 +206,8 @@ Read `references/capacity-management.md`.
 
 ## Reference Files
 
-- **`references/backup-recovery.md`** — recovery models in depth; all backup types; COMPRESSION/CHECKSUM/INIT/encryption; BACKUP TO URL (Azure Blob) and S3 (2022+); RPO/RTO math; restore sequences, STOPAT point-in-time, tail-log, page restore, piecemeal/online restore; VERIFYONLY; restore testing; 3-2-1 rule; backup chains and `log_reuse_wait_desc`; retention/LTR.
-- **`references/maintenance.md`** — index reorg/rebuild thresholds, ONLINE/RESUMABLE/fill factor; statistics (auto vs manual, FULLSCAN, async, TF 2371); DBCC CHECKDB/CHECKTABLE/CHECKALLOC, NO_INFOMSGS, DATA_PURITY; corruption decision tree and `suspect_pages`; Ola Hallengren; maintenance windows.
+- **`references/backup-recovery.md`** — recovery models in depth; all backup types; COMPRESSION/CHECKSUM/INIT/encryption; BACKUP TO URL (Azure Blob single-URL vs striped limits) and S3 (2022+); T-SQL snapshot backup (2022+) and ADR (2019+); RPO/RTO math; restore sequences, STOPAT point-in-time, tail-log, page restore, piecemeal/online restore; VERIFYONLY; restore testing; 3-2-1 rule; backup chains and `log_reuse_wait_desc`; retention/LTR; sp_BlitzBackups / sp_DatabaseRestore.
+- **`references/maintenance.md`** — index reorg/rebuild thresholds, edition gates for ONLINE/RESUMABLE, WAIT_AT_LOW_PRIORITY, fill factor, columnstore rowgroup maintenance; statistics (auto vs manual, FULLSCAN, async, TF 2371); DBCC CHECKDB/CHECKTABLE/CHECKALLOC, NO_INFOMSGS, DATA_PURITY; corruption decision tree (REPAIR runbook template) and `suspect_pages`; Ola Hallengren; maintenance windows.
 - **`references/agent-jobs.md`** — Agent architecture; creating jobs in T-SQL; failure handling/retries; Database Mail; alerts (severity 17–25, performance, WMI); MSX/TSX; Express/MI/Azure SQL DB Elastic Jobs/RDS constraints.
 - **`references/capacity-management.md`** — autogrowth, IFI, data/log file management, VLF management, shrink guidance, growth trending; patching/CU servicing model with rollback and AG rolling-upgrade pointer.
 

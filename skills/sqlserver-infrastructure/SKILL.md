@@ -29,7 +29,7 @@ Before tuning anything, size the four resources. There is no universal "T-shirt 
 - **Storage** — size for **IOPS and latency**, not just capacity. Hit the latency targets below; provision peak (not average) IOPS for checkpoints/backups. Separate data/log/tempdb/backup.
 - **Network** — 1 GbE is often the bottleneck for backups, AG log shipping, and bulk loads; prefer 10 GbE+ for busy or HA instances. Dedicated NICs for AG/mirroring traffic on heavy replicas.
 
-Edition caps the ceiling: **Standard** limits the buffer pool (e.g., 128 GB) and cores (lesser of 4 sockets / 24 cores), so a big box may need **Enterprise** to use all its RAM/CPU. Confirm edition (`SERVERPROPERTY('Edition')`) before promising a memory cap the edition cannot honor. On VMs, prefer fixed/reserved memory and avoid dynamic-memory ballooning for production SQL; pin vCPUs to physical where the hypervisor allows.
+Edition caps the ceiling: **Standard** caps the **buffer pool** at 128 GB (2016+) with *separate* caps for the columnstore segment cache (32 GB on 2022) and per-database In-Memory OLTP data (32 GB on 2022) — so it is not a single hard 128 GB process ceiling; total RAM use can exceed 128 GB. Cores are capped at the lesser of 4 sockets / 24 cores. A big box may need **Enterprise** to use all its RAM/CPU. Confirm edition (`SERVERPROPERTY('Edition')`) before promising a memory cap the edition cannot honor; verify the exact per-cache caps for your version on Microsoft Learn. On VMs, prefer fixed/reserved memory and avoid dynamic-memory ballooning for production SQL; pin vCPUs to physical where the hypervisor allows.
 
 ## Recommended Instance Configuration Baseline
 
@@ -44,29 +44,34 @@ Full catalog with rationale in `references/instance-configuration.md`. The defau
 | `optimize for ad hoc workloads` | 0 | 1 | Caches a plan stub on first use; curbs single-use plan-cache bloat | No |
 | `backup compression default` | 0 | 1 | Smaller, faster backups by default (Standard+ 2016 SP1+) | No |
 | `max worker threads` | 0 (auto) | 0 (leave auto) | Auto formula scales with cores; only change with strong evidence | Yes |
-| `remote admin connections` | 0 | 1 | Allow the **DAC** from remote for break-glass troubleshooting | No |
+| `remote admin connections` | 0 | **0 (conditional — see note)** | Local DAC is always available; enable remote only for a documented break-glass need | No |
 | `default fill factor` | 0 (=100) | 0 (leave; set per-index) | A global non-100 fill factor wastes space everywhere | No |
 | `blocked process threshold (s)` | 0 (off) | 5–20 (with an XEvent capture) | Surface blocking chains; pairs with **sqlserver-monitoring** | No |
 | `priority boost` | 0 | **0 — never enable** | Starves OS threads; can destabilize the box and break clustering | Yes |
 | `lightweight pooling` | 0 | **0 — leave off** | Fiber mode breaks CLR, linked servers, and more | Yes |
 
-Apply with:
+**remote admin connections (remote DAC):** keep **OFF (0)** by default — the local DAC (`sqlcmd -A` from the box console) is always available. Enable (=1) **ONLY** for a documented break-glass need, e.g. a clustered/AG instance whose active-node console is unreachable. If enabled, restrict the source to DBA jump hosts via the host firewall and audit its use.
+
+**Edition gating:** the memory caps above are constrained by **Standard** (buffer pool 128 GB on 2016+, with separate caps for columnstore segment cache and In-Memory OLTP) and core limits (lesser of 4 sockets / 24 cores); `backup compression default` is honored on **Standard+ from 2016 SP1**. Confirm `SERVERPROPERTY('Edition')` before promising any cap the edition cannot honor.
+
+Apply with (placeholder values — substitute your computed per-environment numbers; confirm the target instance first):
 
 ```sql
+-- [CONFIG CHANGE] activates immediately on RECONFIGURE; no rollback beyond re-setting the prior value. Run against the intended instance.
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'cost threshold for parallelism', 50; RECONFIGURE;
-EXEC sp_configure 'max degree of parallelism', 8;      RECONFIGURE;
+EXEC sp_configure 'max degree of parallelism', 8;      RECONFIGURE;  -- physical cores per NUMA node, cap 8
 EXEC sp_configure 'optimize for ad hoc workloads', 1;  RECONFIGURE;
-EXEC sp_configure 'backup compression default', 1;     RECONFIGURE;
+EXEC sp_configure 'backup compression default', 1;     RECONFIGURE;  -- Standard+ from 2016 SP1
 ```
 
-`RECONFIGURE` activates a setting whose change does not need a restart (it sets `value_in_use` from `value`). Settings marked "Restart? Yes" stay pending until the service bounces — script 01 flags `value <> value_in_use` for exactly this reason.
+`RECONFIGURE` activates a setting whose change does not need a restart (it sets `value_in_use` from `value`). Settings marked "Restart? Yes" stay pending until the service bounces — script 01 flags `value <> value_in_use` for exactly this reason. Verify 2025-specific defaults, distros, and image tags on Microsoft Learn for your build.
 
 **Database-scoped configurations (2016+)** let you set MAXDOP, the cardinality estimator (`LEGACY_CARDINALITY_ESTIMATION`), `PARAMETER_SNIFFING`, `QUERY_OPTIMIZER_HOTFIXES`, and `OPTIMIZE_FOR_AD_HOC_WORKLOADS` per database — and per secondary replica — without an instance-wide change. A per-database `MAXDOP` overrides the instance value for that database. See the reference and script 07.
 
 ## Memory Architecture and LPIM
 
-SQL Server divides memory among the **buffer pool** (data/index page cache — usually the largest consumer), the **plan cache**, **query workspace memory** (sort/hash grants), **lock memory**, **CLR**, **thread stacks** (~512 KB/thread on x64, ~2 MB on IA64), and **In-Memory OLTP** memory. Deep treatment in `references/memory-and-cpu.md`.
+SQL Server divides memory among the **buffer pool** (data/index page cache — usually the largest consumer), the **plan cache**, **query workspace memory** (sort/hash grants), **lock memory**, **CLR**, **thread stacks** (2 MB/thread on x64, 512 KB on x86), and **In-Memory OLTP** memory. Deep treatment in `references/memory-and-cpu.md`.
 
 **Max server memory sizing** — the reservation formula (the same one you should never replace with "half the RAM"):
 
@@ -86,7 +91,7 @@ Example for 64 GB dedicated: 64 − 4 − ((64−16)/4) = 64 − 4 − 12 = **48
 ## CPU, NUMA, and Scheduler Basics
 
 - SQL Server creates one **scheduler** per logical CPU (visible online), mapping work onto worker threads cooperatively. `sys.dm_os_schedulers` shows online/offline state, the parent NUMA node, and the runnable-task queue.
-- **NUMA**: on multi-socket hardware, memory is local to a socket; cross-node ("foreign") access is slower. SQL builds **memory nodes** aligned to hardware NUMA. **Automatic soft-NUMA (2016+)** splits a physical node with >8 physical cores into soft nodes for better scheduling — on by default; visible in `sys.dm_os_nodes`.
+- **NUMA**: on multi-socket hardware, memory is local to a socket; cross-node ("foreign") access is slower. SQL builds **memory nodes** aligned to hardware NUMA. **Automatic soft-NUMA (2016+)** splits a node/socket with **>8 physical cores** into soft nodes (ideally 8 cores each, can range 4–8; SMT/hyperthreads are not counted) for better scheduling — on by default; visible in `sys.dm_os_nodes`. Soft-NUMA changes **scheduler grouping**, not memory locality.
 - **MAXDOP follows NUMA**: set it to the number of **physical** cores in a **single NUMA node**, capped at 8, as a starting point. Watch hyperthreading — count physical, not logical, cores. With ≤8 cores per node, MAXDOP ≤ that count.
 - **CPU pressure** shows as `SOS_SCHEDULER_YIELD` waits, a non-empty runnable queue, and high signal-wait %. Diagnosing it is **sqlserver-monitoring's** job; configuring affinity/MAXDOP/soft-NUMA is here. Leave **CPU affinity** at default (auto) unless you are intentionally partitioning cores between instances.
 
@@ -135,7 +140,7 @@ Set globally with `DBCC TRACEON(3226, -1);` or, preferably and durably, as a **`
 Full detail in `references/platform-and-network.md`.
 
 - **Linux (2017+)**: supported on RHEL, Ubuntu, SLES. Configuration is via **`mssql-conf`** (or the `/var/opt/mssql/mssql.conf` file), not Windows policy — e.g. `sudo /opt/mssql/bin/mssql-conf set memory.memorylimitmb 49152`, `... set network.tcpport 1433`, traceflags, and `telemetry.customerfeedback`. HA on Linux uses **Pacemaker** (cross-ref **sqlserver-ha-clustering**); there is no classic shared-storage FCI.
-- **Containers**: the official image is `mcr.microsoft.com/mssql/server`. Required env: `ACCEPT_EULA=Y`, `MSSQL_SA_PASSWORD=<strong>`, and `MSSQL_PID` (Developer/Express/Standard/Enterprise). **Persist `/var/opt/mssql`** on a named volume or the data is ephemeral. On Kubernetes use a **StatefulSet** with a PVC (and an operator for AG-based HA). Containers are excellent for dev/CI; production needs deliberate storage and HA design.
+- **Containers**: the official image is `mcr.microsoft.com/mssql/server`. Required env: `ACCEPT_EULA=Y`, `MSSQL_SA_PASSWORD` (inject from a secret manager / `--env-file` — `N'<generate-32+char-random-secret>'`, never a literal in the command), and `MSSQL_PID` (Developer/Express/Standard/Enterprise). **Persist `/var/opt/mssql`** on a named volume or the data is ephemeral. The 2019+ image runs as the **non-root `mssql` user (UID 10001)** — mounted-volume ownership must allow that UID, and the pod/cgroup memory limit must exceed `memory.memorylimitmb` to avoid OOM-kills. On Kubernetes use a **StatefulSet** with a PVC (and an operator for AG-based HA). Containers are excellent for dev/CI; production needs deliberate storage and HA design.
 
 ## Network, Ports, and Protocols
 
@@ -182,3 +187,5 @@ Every script is read-only, sets `SET NOCOUNT ON;`, version-guards DMVs/columns, 
 - **`scripts/06-trace-flags.sql`** — `DBCC TRACESTATUS(-1)` global flags captured to a temp table and selected, plus a commented reference list of common flags.
 - **`scripts/07-database-scoped-config.sql`** — `sys.database_scoped_configurations` per online user DB, highlighting non-default values (MAXDOP, LEGACY_CARDINALITY_ESTIMATION, PARAMETER_SNIFFING, etc.).
 - **`scripts/08-server-properties.sql`** — `SERVERPROPERTY` dump (version/level/edition/engine edition/collation/clustered/HADR/integrated-security/machine/instance), `sys.dm_os_sys_info` (cpu_count, physical_memory, start time, VM type, container type 2017+ guard), `sys.dm_os_host_info` (2017+, OS platform) guard.
+
+**Community tools:** for a fast, prioritized config audit beyond these scripts, Brent Ozar's read-only **`sp_Blitz`** (First Responder Kit, MIT) flags risky `sp_configure` values, memory/MAXDOP/tempdb issues, and more — see the community-tools doc in **sqlserver-monitoring**. Review any third-party proc before running in production.

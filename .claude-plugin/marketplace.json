@@ -1,6 +1,6 @@
 {
   "name": "sqlserver",
-  "description": "Dedicated Microsoft SQL Server expert plugin covering the full scope of database management — operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud offerings, and security/authentication — across versions 2016-2025 and the Azure SQL / AWS RDS cloud families.",
+  "description": "Dedicated Microsoft SQL Server expert plugin covering the full scope of database management — operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud offerings, security/authentication, and an offline DuckDB-powered analysis & recommendations advisor — across versions 2016-2025 and the Azure SQL / AWS RDS / Google Cloud SQL families.",
   "owner": {
     "name": "Christopher Huffman",
     "email": "chrishuffman85@gmail.com"
@@ -8,8 +8,8 @@
   "plugins": [
     {
       "name": "sqlserver",
-      "description": "Dedicated Microsoft SQL Server expert plugin: operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud, and security/authentication — SQL Server 2016-2025 plus Azure SQL and AWS RDS.",
-      "version": "0.1.0",
+      "description": "Dedicated Microsoft SQL Server expert plugin: operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud, security/authentication, and an offline DuckDB analysis & recommendations advisor — SQL Server 2016-2025 plus Azure SQL, AWS RDS, and Google Cloud SQL.",
+      "version": "0.2.0",
       "source": {
         "source": "url",
         "url": "https://github.com/chrishuffman5/sqlserver.git"

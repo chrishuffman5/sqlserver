@@ -28,10 +28,12 @@ Each level protects (encrypts) the level below it:
 - **Certificates / asymmetric keys** protect symmetric keys; the **TDE certificate** in particular must be backed up *with its private key*.
 
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm the target instance/DB. Store the .bak files and the
+-- protecting passwords in a secret manager, OFF-box; never commit; rotate any value pasted from docs.
 BACKUP SERVICE MASTER KEY TO FILE = N'...smk.bak'
-    ENCRYPTION BY PASSWORD = N'<secret>';
+    ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>';
 BACKUP MASTER KEY TO FILE = N'...dmk.bak'
-    ENCRYPTION BY PASSWORD = N'<secret>';
+    ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>';
 ```
 
 ---
@@ -40,38 +42,40 @@ BACKUP MASTER KEY TO FILE = N'...dmk.bak'
 
 **TDE encrypts data at rest** — the `.mdf`/`.ndf`/`.ldf` files and every backup — transparently to applications. It defeats the "someone stole the drive / the backup file" threat. It does **not** protect against an authorized user querying the data, nor data in memory, nor data on the wire.
 
-**Availability:** Enterprise (and Developer) historically; **all editions from SQL Server 2019**. On **Azure SQL DB/MI** TDE is **on by default** with a service-managed key (or bring-your-own AKV key).
+**Availability:** Enterprise (and Developer/Evaluation) historically; **Standard, Web, and Express from SQL Server 2019** (note Express's own limitations — e.g. it cannot *create* encrypted backups, only restore them). On **Azure SQL DB/MI** TDE is **on by default** with a service-managed key (or bring-your-own AKV key). Verify edition support for your build on Microsoft Learn.
 
 **How it works:** a per-database symmetric **Database Encryption Key (DEK)** encrypts the data pages; the DEK is protected by a **certificate** (or asymmetric key) in `master`. Encryption/decryption happens at the page-I/O layer.
 
 ### Setup (box product)
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm the target instance/DB (use a placeholder [MyDB]).
+-- Source/store the protecting passwords in a secret manager; back up keys + cert OFF-box; never commit.
 -- 1. Master key + certificate in MASTER
 USE master;
-CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'<strong>';
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>';
 CREATE CERTIFICATE TDECert WITH SUBJECT = 'TDE Certificate';
 
 -- 2. >>> BACK UP THE CERTIFICATE + PRIVATE KEY IMMEDIATELY <<<  (CRITICAL)
 BACKUP CERTIFICATE TDECert
     TO FILE = N'C:\keys\TDECert.cer'
     WITH PRIVATE KEY (FILE = N'C:\keys\TDECert.pvk',
-                      ENCRYPTION BY PASSWORD = N'<different-strong>');
+                      ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>');  -- distinct from the master-key password
 
 -- 3. DEK in the user database, protected by the certificate
-USE MyDB;
+USE [MyDB];
 CREATE DATABASE ENCRYPTION KEY
     WITH ALGORITHM = AES_256
     ENCRYPTION BY SERVER CERTIFICATE TDECert;
 
--- 4. Turn it on
-ALTER DATABASE MyDB SET ENCRYPTION ON;
+-- 4. Turn it on (initial encryption scan runs in the background; watch sys.dm_database_encryption_keys)
+ALTER DATABASE [MyDB] SET ENCRYPTION ON;
 ```
 
 ### Critical facts
 - **Certificate backup is non-negotiable.** Without the certificate + private key you cannot restore the database or its backups on another server — the data is gone. Back it up the moment you create it, store it separately from the data backups.
 - **tempdb gets encrypted** as soon as *any* database on the instance uses TDE (shared resource). This adds a small overhead even to non-TDE databases.
 - **Performance:** roughly **3-5% CPU**. Mostly affects scans and cold reads.
-- **Backup compression interaction:** encrypted data compresses poorly. Historically TDE + `COMPRESSION` gave little benefit; **2016+** improved this (with `MAXTRANSFERSIZE` ≥ 65537 the engine compresses then encrypts). Expect smaller gains than on unencrypted DBs.
+- **Backup compression interaction:** encrypted data compresses poorly. Historically TDE + `COMPRESSION` gave little benefit; **SQL Server 2016+** added an optimized "decrypt-extent → compress → re-encrypt" path that engages only when `MAXTRANSFERSIZE` is set **greater than 65536** (i.e. ≥ 65537 bytes; specifying exactly 65536 does *not* trigger it). From **SQL Server 2019 CU5**, setting `MAXTRANSFERSIZE` is no longer required — the optimized path is used automatically. Expect smaller gains than on unencrypted DBs. (Verify the exact build behavior on Microsoft Learn for your version.)
 - **Key rotation:** rotate the DEK (`ALTER DATABASE ENCRYPTION KEY ... REGENERATE`) and/or re-protect it with a new certificate periodically; re-back-up the new certificate.
 - **EKM / Azure Key Vault as protector:** with the SQL Server Connector for Azure Key Vault (Extensible Key Management), the TDE protector can live in **AKV/HSM** instead of a local certificate — centralizing key custody and rotation. This is the standard pattern in cloud/regulated environments.
 
@@ -111,11 +115,16 @@ Use **deterministic** only where equality search is required and the leakage is 
 - Bulk/ETL tooling must be AE-aware.
 
 ### Secure enclaves (2019+)
-A **secure enclave** is a protected memory region inside the engine the driver can trust (via **attestation**, historically Host Guardian Service; **2022+** supports Microsoft Azure Attestation and VBS enclaves). With enclaves you gain:
+A **secure enclave** is a protected memory region inside the engine the driver can trust (verified via **attestation**). Enclave technology and attestation differ by platform:
+- **SQL Server box, 2019+ (Windows only):** **VBS enclaves** (software-based, no special hardware; Intel SGX is *not* supported on box). Attestation uses **Host Guardian Service (HGS)**, or recent client drivers can use VBS enclaves **without attestation**. (Don't assume VBS enclaves are a 2022 feature — they shipped in 2019.)
+- **SQL Server 2022** did not change the box enclave/attestation model but **expanded the confidential-query surface** — adding `JOIN`, `GROUP BY`, and `ORDER BY` inside the enclave (2019 supported comparisons/`BETWEEN`/`IN`/`LIKE`/`DISTINCT` and nested-loop joins only; DB compat level 160+ required).
+- **Azure SQL Database:** **Intel SGX enclaves** on DC-series hardware (attestation **mandatory**, via **Microsoft Azure Attestation**), or VBS enclaves on other tiers (no attestation).
+
+With enclaves you gain:
 - **Rich computations** on encrypted columns — `LIKE`, range comparisons — even on **randomized** columns.
 - **In-place encryption / key rotation** without moving data out to the client.
 
-Enable per CMK with `ENCLAVE_COMPUTATIONS (SIGNATURE = ...)` and configure the instance's attestation. The driver still controls keys; the enclave just lets it delegate computation securely.
+Enable per CMK with `ENCLAVE_COMPUTATIONS (SIGNATURE = ...)` and configure the instance's attestation. The only supported CMK stores for enclave-enabled keys are the **Windows Certificate Store** and **Azure Key Vault**. The driver still controls keys; the enclave just lets it delegate computation securely. (Verify the current per-platform matrix on Microsoft Learn.)
 
 ```sql
 -- Inventory AE configuration (read-only)
@@ -159,11 +168,12 @@ Force Encryption itself is a **registry/Configuration-Manager** setting and cann
 
 ## 5. Backup Encryption
 
-Encrypts the **backup file** itself, independent of TDE (useful when the DB isn't TDE-encrypted but the backups leave the building). **2014+, all editions.**
+Encrypts the **backup file** itself, independent of TDE (useful when the DB isn't TDE-encrypted but the backups leave the building). **2014+.** Edition gate: **Enterprise and Standard can create** encrypted backups; **Express and Web cannot create them** — but any edition (including Express/Web) can **restore** an encrypted backup. (Verify on Microsoft Learn, *Backup encryption*.)
 
 ```sql
--- Requires a certificate or asymmetric key in master (back it up too!)
-BACKUP DATABASE MyDB TO DISK = N'...MyDB.bak'
+-- [SECURITY CHANGE] illustrative; confirm the target instance/DB (placeholder [MyDB]).
+-- Requires a certificate or asymmetric key in master (back it up + its private key, OFF-box!).
+BACKUP DATABASE [MyDB] TO DISK = N'...MyDB.bak'
 WITH ENCRYPTION (ALGORITHM = AES_256, SERVER CERTIFICATE = BackupCert),
      COMPRESSION, CHECKSUM, INIT;
 ```
@@ -188,6 +198,8 @@ ORDER BY backup_start_date DESC;
 The original, manual approach: encrypt individual values with **`ENCRYPTBYKEY` / `DECRYPTBYKEY`** (or `...BYCERT`/`...BYPASSPHRASE`) using a symmetric key opened in the session. Server-side keys, so unlike Always Encrypted the **engine can see plaintext** when the key is open.
 
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), test in a scratch DB
+-- (the UPDATE rewrites column data — run only against a copy until validated).
 CREATE SYMMETRIC KEY CardKey WITH ALGORITHM = AES_256
     ENCRYPTION BY CERTIFICATE DataCert;
 
@@ -220,6 +232,16 @@ Lifecycle hygiene:
 - In cloud/regulated estates, prefer **Azure Key Vault** (TDE protector / AE CMK) for centralized custody, audit, and rotation.
 
 `scripts/04-encryption-status.sql` reports TDE state, certificate expiry, Always Encrypted inventory, and backup-encryption usage.
+
+---
+
+## 8. Per-Platform Divergence (callouts)
+
+Key management diverges sharply by deployment target — design for the platform, not the box defaults:
+
+- **Azure SQL Database / MI — TDE:** on **by default** and **service-managed**; there is **no SMK/DMK/server-certificate hierarchy to manage** as on box. You may switch to **customer-managed TDE (BYOK)** where the **TDE protector is an asymmetric key in Azure Key Vault** (Managed HSM optional). You don't `BACKUP CERTIFICATE`; instead you protect AKV access (soft-delete/purge-protection) and the key. Rotation is an AKV/portal operation. See `sqlserver-cloud`.
+- **Always Encrypted — CMK store differences:** box uses the **Windows Certificate Store** or **Azure Key Vault**; cloud apps typically use **AKV**. For **enclaves**, only Windows Certificate Store and AKV are supported CMK stores. The store choice affects who holds the keys and how the client authenticates to it (managed identity to AKV is preferred in Azure).
+- **AWS RDS for SQL Server — TDE:** enabled via an **RDS option group** (`TRANSPARENT_DATA_ENCRYPTION` option), not by managing certificates yourself; **RDS owns and rotates the keys** and you can't export the certificate. This constrains cross-platform restore (you can't move an RDS-TDE backup to a self-managed instance the usual way). Native backup/restore between RDS and box is limited accordingly — verify current RDS option-group behavior in `sqlserver-cloud`.
 
 ---
 

@@ -51,10 +51,12 @@ The clustered key is duplicated into *every* nonclustered index as the row locat
 Order key columns by the predicate they serve, put equality columns before range columns, and use `INCLUDE` to cover the SELECT list without widening the key:
 
 ```sql
--- Query: WHERE A = @a AND B = @b ORDER BY ... , returning C, D
+-- [SCHEMA CHANGE] Query: WHERE A = @a AND B = @b ORDER BY ... , returning C, D
+-- Size-of-data create; OFFLINE takes a Sch-M lock (ONLINE = ON Enterprise/Azure-only).
+-- Confirm target DB (SELECT DB_NAME()); use a maintenance window for large tables.
 CREATE NONCLUSTERED INDEX IX_T_A_B_inc
-    ON dbo.T (A, B)          -- key: equality predicates, in selectivity order
-    INCLUDE (C, D);          -- payload: covers the SELECT, no key-lookup
+    ON dbo.[MyDB_Table] (A, B)   -- key: equality predicates, in selectivity order
+    INCLUDE (C, D);              -- payload: covers the SELECT, no key-lookup
 ```
 
 `INCLUDE` columns live only in the leaf level — they cover the query (eliminating **Key Lookups**) without bloating intermediate levels or participating in the key's sort/uniqueness.
@@ -76,6 +78,8 @@ CREATE NONCLUSTERED INDEX IX_T_A_B_inc
 **Filtered-index gotcha:** a *parameterized* query (`WHERE Status = @s`) usually will **not** use a filtered index defined `WHERE Status = 'Active'`, because the optimizer can't prove `@s` matches the filter at compile time. Use a literal, `OPTION (RECOMPILE)`, or a regular index for parameterized access.
 
 **Missing-index DMVs are hints, not orders.** `sys.dm_db_missing_index_*` suggests indexes per query without consolidating overlaps, ignoring write cost and existing indexes. Always consolidate, dedupe, and weigh DML overhead before creating — see `scripts/02-missing-indexes.sql`. For finding unused/duplicate indexes to drop, see `scripts/01-index-usage.sql` and `scripts/04-duplicate-overlapping-indexes.sql`. **Index maintenance (rebuild/reorganize thresholds, `FILLFACTOR` tuning, fragmentation jobs) lives in `sqlserver-operations`** — this skill covers *design*; `scripts/03-index-fragmentation.sql` here is assessment-only.
+
+> **Community tooling (read-only):** for consolidated index analysis (missing/unused/duplicate/overly-wide indexes and heaps) use Brent Ozar's **`sp_BlitzIndex`**; for the most resource-intensive cached plans with warnings (implicit conversions, spills, missing indexes) use **`sp_BlitzCache`**. Both are read-only diagnostics from the First Responder Kit — see the community-tools section in **`sqlserver-monitoring`** for install/usage and safety notes.
 
 Full coverage (delta store / tuple mover / rowgroup quality, key-lookup elimination, hash bucket sizing) in `references/indexing.md`.
 
@@ -102,9 +106,12 @@ The optimizer is **cost-based**: it estimates rows (cardinality) from **statisti
 - **Ascending-key problem:** newly inserted rows above the histogram's max are estimated as 1 row until stats refresh. Mitigate with `FULLSCAN` updates, TF 2389/2390, or TF 4139 (compat-dependent).
 - **Cardinality Estimator versions:** the **legacy CE** (model 70, used when compat < 120) vs. the **new CE** (compat ≥ 120, default since 2014). The new CE changes correlation/independence and "stale-stats" assumptions; most queries improve, a minority regress. Test a suspected regression *without* a code change:
   ```sql
-  -- Force legacy CE for one query
+  -- Force legacy CE for one query (read-only test; no persistent change)
   SELECT ... OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'));
-  -- Or per-database, scoped:
+
+  -- [CONFIG CHANGE] Or per-database, scoped (database-wide behavior change affecting EVERY query):
+  -- confirm target via SELECT DB_NAME(); last resort after per-query USE HINT testing;
+  -- capture a Query Store baseline first; rollback = SET LEGACY_CARDINALITY_ESTIMATION = OFF.
   ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = ON;
   ```
 
@@ -119,7 +126,7 @@ Detect it with `scripts/07-parameter-sniffing-detect.sql` (high duration varianc
 | # | Technique | Version | Trade-off |
 |---|---|---|---|
 | 1 | **Query Store plan forcing / hints** | 2016 force / 2022 hints | No code change; pins a known-good plan or applies a hint out-of-band. Best first move. |
-| 2 | **PSP optimization (multiple dispatched plans)** | 2022 (compat 160) | Automatic; up to 3 plan variants keyed on predicate cardinality. Zero code change. |
+| 2 | **PSP optimization (multiple dispatched plans)** | 2022 (compat 160) | Automatic; evaluates up to **three** at-risk *equality* predicates, dispatching query variants by cardinality bucket. Zero code change; needs Query Store ON for full insight. Disable a regression with `SET PARAMETER_SENSITIVE_PLAN_OPTIMIZATION = OFF`. |
 | 3 | **`OPTION (OPTIMIZE FOR UNKNOWN)`** | all | Uses average density instead of sniffed values — a stable, mediocre plan. Loses sniffing's upside. |
 | 4 | **`OPTION (OPTIMIZE FOR (@p = <value>))`** | all | Pins estimation to a representative value you choose. |
 | 5 | **`OPTION (RECOMPILE)`** | all | Fresh, perfectly-sniffed plan every call. CPU cost per execution; no plan reuse; great for rare wildly-variable queries. |
@@ -153,6 +160,8 @@ Isolation level is a *design* decision about which concurrency phenomena you tol
 
 **Engineering guidance:** enable **`READ_COMMITTED_SNAPSHOT ON`** for OLTP — it gives non-blocking, *consistent* reads without `NOLOCK`'s integrity hazards, at the cost of tempdb version-store usage. Use `SNAPSHOT` for long read transactions needing a stable point-in-time view (watch for `3960` update conflicts). The version store and long-transaction interactions are an operational/monitoring concern — diagnose live version-store bloat and blocking in **`sqlserver-monitoring`**; this skill chooses the level and writes the access pattern.
 
+> **`READ_COMMITTED_SNAPSHOT` is a planned change, not a free switch.** `[CONFIG CHANGE]` `ALTER DATABASE [MyDB] SET READ_COMMITTED_SNAPSHOT ON` requires **brief exclusive access** to the database — all other connections must be out (or use `WITH ROLLBACK AFTER n SECONDS` / `WITH ROLLBACK IMMEDIATE` to force them off). It shifts read load onto the **tempdb version store** (size and monitor tempdb), adds 14 bytes per row over time, and changes read semantics application-wide. Schedule it in a maintenance window; rollback = `SET READ_COMMITTED_SNAPSHOT OFF` (also needs exclusive access). On **SQL Server 2025 / Azure SQL, optimized locking** (requires Accelerated Database Recovery; LAQ benefits most with RCSI on) is an additional concurrency design lever — verify availability/behavior on Microsoft Learn for your build.
+
 ## Worked Example — from scan to seek
 
 A request like *"this query is slow: `SELECT OrderID, Amount FROM dbo.[Order] WHERE CustomerID = @c AND Status = 'Open' ORDER BY OrderDate DESC`"* — the engineering sequence:
@@ -162,8 +171,10 @@ A request like *"this query is slow: `SELECT OrderID, Amount FROM dbo.[Order] WH
 3. **Check the estimate gap** — 1000× off → stale stats or sniffing. Refresh stats (`scripts/06`); if variance + multiple plans, it's sniffing (`scripts/07`).
 4. **Design a covering index** — equality keys first (`CustomerID`), then the `ORDER BY` column to avoid the Sort, covering the SELECT:
    ```sql
+   -- [SCHEMA CHANGE] size-of-data create; OFFLINE takes a Sch-M lock (ONLINE = ON is Enterprise/Azure-
+   -- only). Confirm target DB (SELECT DB_NAME()) and run large builds in an approved maintenance window.
    CREATE NONCLUSTERED INDEX IX_Order_Customer_Open
-       ON dbo.[Order] (CustomerID, OrderDate DESC)
+       ON dbo.[MyDB_Order] (CustomerID, OrderDate DESC)
        INCLUDE (Amount)
        WHERE Status = 'Open';   -- filtered: small hot subset (use a literal, not @status)
    ```

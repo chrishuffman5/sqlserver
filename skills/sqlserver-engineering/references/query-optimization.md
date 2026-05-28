@@ -34,6 +34,7 @@ Inspect with `DBCC SHOW_STATISTICS('dbo.T', 'stat_name')` or `sys.dm_db_stats_pr
 - Auto-update uses a **sampled** scan (a small percentage on large tables). For skewed data this can produce a poor histogram. `UPDATE STATISTICS ... WITH FULLSCAN` reads every row for an exact histogram — schedule it for skewed/critical tables (a maintenance task → `sqlserver-operations`).
 - Compare `rows` vs `rows_sampled` (and the modification counter) in `scripts/06` to spot under-sampled or stale stats.
 - **Filtered statistics** (`CREATE STATISTICS ... WHERE ...`) give a sharper histogram for a subset, helping correlated/skewed predicates.
+- **Incremental statistics** (2014+, `WITH INCREMENTAL = ON`) maintain per-partition statistics on a partitioned table and merge them into the table-level histogram, so loading one partition triggers a stats update for *that partition* instead of a full-table rescan. The auto-update threshold is then evaluated per partition — far less work on large partitioned fact tables. Set it at index/stats creation or via `ALTER TABLE ... SET (FILESTREAM... )`/`UPDATE STATISTICS ... WITH RESAMPLE, INCREMENTAL = ON`. (Note: the merged histogram is still capped at 200 steps, and a few features — e.g. some filtered-stats combinations — don't support incremental.)
 
 ### The ascending-key problem
 On an ever-increasing column (dates, IDENTITY), newly inserted rows sit **above the histogram's max**. Until stats refresh, predicates on the new range estimate **1 row**, producing nested-loop plans that explode at runtime. Mitigations:
@@ -53,12 +54,15 @@ The CE turns statistics into row estimates. There are two models:
 Most workloads improve under the new CE; a minority regress (often where the legacy independence assumption happened to match the data). **Test a suspected regression without changing the query first:**
 
 ```sql
--- Per-query: force legacy estimation
+-- Per-query: force legacy estimation (read-only test; no persistent change)
 SELECT ... OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'));
 -- Per-query: force the new CE even if the DB is on legacy
 SELECT ... OPTION (USE HINT('FORCE_DEFAULT_CARDINALITY_ESTIMATION'));
 
--- Per-database (scoped, survives without raising compat level):
+-- [CONFIG CHANGE] Per-database, scoped — DATABASE-WIDE behavior change affecting EVERY query.
+-- Confirm target via SELECT DB_NAME(); a LAST RESORT after per-query USE HINT testing proves the
+-- whole workload (not one query) benefits; capture a Query Store baseline FIRST so you can compare.
+-- Rollback = SET LEGACY_CARDINALITY_ESTIMATION = OFF.
 ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = ON;
 ```
 
@@ -102,7 +106,7 @@ Mitigations, **least to most invasive**:
 |---|---|---|---|
 | 1 | **Query Store plan forcing** | 2016+ | Pin a specific known-good plan to the query out-of-band. Zero code change. Survives recompiles. Verify the forced plan stays valid (forcing can fail if the plan becomes invalid). |
 | 1b | **Query Store hints** | 2022+ | Apply a query hint (e.g. `RECOMPILE`, `OPTIMIZE FOR`) to a query *by query_id*, no code change — the modern way to hint third-party/sealed code (`sys.sp_query_store_set_hints`). |
-| 2 | **PSP optimization (Parameter-Sensitive Plan)** | 2022 (compat 160) | The engine automatically caches up to **3** plan variants for a single parameterized statement, dispatched by the predicate's cardinality bucket (based on the column's stats). Fully automatic; the best first-line fix on 2022+ for the classic skew case. Currently one predicate, equality, on a skewed column. |
+| 2 | **PSP optimization (Parameter-Sensitive Plan)** | 2022 (compat 160) | At compile time the engine evaluates the most at-risk parameterized predicates — **up to three** of them — and builds a *dispatcher plan* that routes runtime values into cardinality **buckets** (low/medium/high), each mapped to its own query variant. Fully automatic; the best first-line fix on 2022+ for the classic skew case. **Equality predicates only**; among multiple eligible predicates on the same table it picks the most skewed (a `UNION`/self-join can surface more). |
 | 3 | **`OPTION (OPTIMIZE FOR UNKNOWN)`** | all | Ignore the sniffed value; estimate from **average density**. Produces one stable, mediocre-for-everyone plan. Good when no single plan should win. Loses sniffing's upside. |
 | 4 | **`OPTION (OPTIMIZE FOR (@p = <typical value>))`** | all | Compile as if `@p` were the representative value you choose. Good when you know the common case. Bad if the chosen value stops being representative. |
 | 5 | **`OPTION (RECOMPILE)`** | all | Recompile every execution with the *actual* values → always the right plan, never reused. Per-call CPU cost; no plan-cache footprint. Ideal for low-frequency, highly variable queries. Also unlocks filtered-index/literal-substitution benefits. |
@@ -110,6 +114,19 @@ Mitigations, **least to most invasive**:
 | 7 | **Local-variable copy** | all | Copy params into local variables so the optimizer can't sniff → falls back to density (same effect as OPTIMIZE FOR UNKNOWN). Works, but it's an *accidental* mechanism — prefer the explicit hint so intent is clear. |
 
 **Decision guide:** on 2022+, try Query Store hints/forcing (1/1b) and let PSP (2) handle classic skew; reach for `RECOMPILE` (5) for rare variable queries and `OPTIMIZE FOR UNKNOWN` (3) when you want one stable plan. Avoid plan guides (6) unless you can't change the code and lack Query Store.
+
+**Troubleshooting a PSP regression:** PSP is automatic at compat 160 but can itself pick a bad bucketization. To disable it without dropping compat level:
+```sql
+-- Per-query: skip PSP for one statement
+SELECT ... OPTION (USE HINT('DISABLE_PARAMETER_SENSITIVE_PLAN'));
+
+-- [CONFIG CHANGE] Per-database: turn PSP off database-wide (confirm via SELECT DB_NAME();
+-- affects every parameterized query; rollback = SET PARAMETER_SENSITIVE_PLAN_OPTIMIZATION = ON).
+ALTER DATABASE SCOPED CONFIGURATION SET PARAMETER_SENSITIVE_PLAN_OPTIMIZATION = OFF;
+```
+Note: disabling parameter sniffing (TF 4136 / `PARAMETER_SNIFFING` scoped config / `DISABLE_PARAMETER_SNIFFING`) also disables PSP. PSP, CE feedback, and memory-grant-feedback persistence all rely on **Query Store being ON** to persist their learning, and PSP/CE/DOP feedback are **compatibility-level gated** (see §9).
+
+> **Community tooling (read-only):** to detect parameter-sniffing/skew symptoms across the workload, Brent Ozar's **`sp_BlitzCache`** ranks the most resource-intensive cached plans and flags warnings (implicit conversions, spills, missing indexes). For always-on historical baselining of plan/duration variance, Erik Darling's **PerformanceMonitor** is a continuous collector (an install, not a read-only snapshot). See the community-tools section in **`sqlserver-monitoring`**.
 
 ---
 
@@ -166,7 +183,9 @@ IQP is a family of features that make the engine adapt plans automatically. They
 - **Optimized plan forcing** — speeds recompiles of forced plans by persisting compilation steps.
 - **Memory grant feedback** improvements: percentile-based + persisted (see §8).
 
-**SQL Server 2025 (compat 170):** continued IQP refinements plus engine features (optimized locking, native vector/JSON) — confirm specifics against the target build. Several IQP features (CE feedback, DOP feedback, PSP) require Query Store to be **ON** to persist their learning.
+**SQL Server 2025 (compat 170):** continued IQP refinements (PSP gains DML support, expanded `tempdb`, and better multi-predicate handling) plus engine features — confirm specifics against the target build. **Optimized locking** (a concurrency design lever) holds a single **Transaction-ID (TID) lock** instead of many row/key locks and uses **Lock After Qualification (LAQ)** to take locks only on rows that actually qualify; it requires **Accelerated Database Recovery (ADR)** enabled, is **off by default** on box 2025, and LAQ benefits most with **RCSI** on — verify availability/behavior on Microsoft Learn for your build. Native `vector`/`json` types also arrive in 2025.
+
+**Query Store dependency & compat gating:** several IQP features — **CE feedback, DOP feedback, PSP**, and **memory-grant-feedback persistence** — require Query Store to be **ON** to persist their learning across recompiles/restarts, and each is gated by **database compatibility level** (raising compat is how you opt in). Confirm both before relying on adaptive behavior.
 
 **Azure SQL DB/MI** typically receive IQP features at or before the corresponding box compat level — when in doubt, check the database's compat level and test.
 

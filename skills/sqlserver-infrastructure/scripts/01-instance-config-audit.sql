@@ -44,7 +44,7 @@ SELECT
         WHEN 'optimize for ad hoc workloads'    THEN 'Set to 1 - caches plan stub, curbs cache bloat.'
         WHEN 'backup compression default'       THEN 'Set to 1 (Standard+ 2016 SP1+).'
         WHEN 'max worker threads'               THEN 'Leave 0 (auto) unless strong THREADPOOL evidence.'
-        WHEN 'remote admin connections'         THEN 'Set to 1 to allow remote DAC for break-glass.'
+        WHEN 'remote admin connections'         THEN 'Leave 0; local DAC always works. Set 1 only for documented break-glass, then firewall to jump hosts + audit.'
         WHEN 'blocked process threshold (s)'    THEN '5-20s with an XEvent capture; 0 = off.'
         WHEN 'priority boost'                   THEN 'MUST be 0. Never enable.'
         WHEN 'lightweight pooling'              THEN 'MUST be 0. Fiber mode breaks CLR/linked servers.'
@@ -60,7 +60,7 @@ SELECT
         WHEN c.name = 'backup compression default'    AND c.value_in_use = 0                  THEN 'DEVIATION - recommend 1'
         WHEN c.name = 'priority boost'                AND c.value_in_use = 1                  THEN 'CRITICAL - disable immediately'
         WHEN c.name = 'lightweight pooling'           AND c.value_in_use = 1                  THEN 'CRITICAL - disable'
-        WHEN c.name = 'remote admin connections'      AND c.value_in_use = 0                  THEN 'REVIEW - enable for remote DAC'
+        WHEN c.name = 'remote admin connections'      AND c.value_in_use = 1                  THEN 'REVIEW - remote DAC enabled; confirm break-glass justification, firewall + audit'
         ELSE 'ok / review'
     END                                                 AS deviation_flag
 FROM sys.configurations AS c
@@ -102,7 +102,7 @@ EXEC sp_configure 'cost threshold for parallelism', 50;   RECONFIGURE;
 EXEC sp_configure 'max degree of parallelism', 8;         RECONFIGURE;  -- physical cores per NUMA node, cap 8
 EXEC sp_configure 'optimize for ad hoc workloads', 1;     RECONFIGURE;
 EXEC sp_configure 'backup compression default', 1;        RECONFIGURE;
-EXEC sp_configure 'remote admin connections', 1;          RECONFIGURE;
+EXEC sp_configure 'remote admin connections', 0;          RECONFIGURE;  -- leave OFF; local DAC always works. Set 1 only for documented break-glass, then firewall to jump hosts + audit
 EXEC sp_configure 'blocked process threshold', 15;        RECONFIGURE;
 EXEC sp_configure 'priority boost', 0;                    RECONFIGURE;  -- restart to change if it was on
 EXEC sp_configure 'lightweight pooling', 0;               RECONFIGURE;  -- restart to change if it was on

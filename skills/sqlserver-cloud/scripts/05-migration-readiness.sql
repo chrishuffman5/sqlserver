@@ -11,15 +11,24 @@
  *           this script gives a fast first read.)
  * Safety  : Read-only. No modifications to data or configuration.
  *
+ * SCOPE - IMPORTANT: this is a MULTI-DATABASE instance assessment.
+ *   * Sections 1, 2, 4, 5, 6 are SERVER-WIDE - run once on the instance.
+ *   * Sections 3a-3d assess the CURRENT DATABASE ONLY (cross-DB refs, CLR,
+ *     FILESTREAM, Service Broker). To assess every user database, SWITCH
+ *     CONTEXT and re-run Section 3 in EACH database (USE [db]; or sp_ineachdb /
+ *     a cursor over sys.databases). Running it once in [master] UNDER-ASSESSES a
+ *     multi-DB instance and can hide Azure-SQL-DB blockers in other databases.
+ *
  * Sections:
  *   0. Platform guard (run against a SOURCE box engine, not a PaaS target)
- *   1. Compatibility level per database
- *   2. Deprecated / discontinued feature use (perf counters)
+ *   1. Compatibility level per database                       [server-wide]
+ *   2. Deprecated / discontinued feature use (perf counters)  [server-wide]
  *   3. Azure-SQL-DATABASE blocking features (cross-DB refs, CLR, FILESTREAM,
  *      Service Broker, Agent jobs, linked servers, server logins)
- *   4. Database size & file count
- *   5. Non-default collation (instance & databases)
- *   6. Instance-level object inventory to recreate at the target
+ *        3a-3d = CURRENT DB ONLY (run in EACH database); 3e-3f = server-wide
+ *   4. Database size & file count                             [server-wide]
+ *   5. Non-default collation (instance & databases)           [server-wide]
+ *   6. Instance-level object inventory to recreate at the target [server-wide]
  ******************************************************************************/
 SET NOCOUNT ON;
 
@@ -47,6 +56,10 @@ END;
 SELECT 'Tip: this is a fast first read. Run the Data Migration Assistant (DMA) '
      + 'for the authoritative compatibility + feature-parity report and a SKU '
      + 'recommendation for your chosen target.' AS info_message;
+
+SELECT 'SCOPE: Sections 1/2/4/5/6 are server-wide. Sections 3a-3d assess only '
+     + 'the CURRENT database (' + DB_NAME() + '). Re-run Section 3 in EACH user '
+     + 'database to avoid under-assessing a multi-DB instance.' AS scope_warning;
 
 /*──────────────────────────────────────────────────────────────────────────────
   Section 1: Compatibility level per database
@@ -87,10 +100,12 @@ IF @@ROWCOUNT = 0
 /*──────────────────────────────────────────────────────────────────────────────
   Section 3: Features that BLOCK Azure SQL Database specifically
   These are fine for MI / SQL-on-VM but must be refactored for Azure SQL DB.
+  ** 3a-3d scan the CURRENT DATABASE ONLY -> RUN IN EACH USER DATABASE. **
+  ** 3e (Agent jobs) and 3f (linked servers) are server-wide.            **
 ──────────────────────────────────────────────────────────────────────────────*/
 
 -- 3a. Cross-database references (3-part / cross-DB dependencies) in the CURRENT DB.
---     Run per database; cross-DB refs are the classic Azure SQL DB blocker.
+--     CURRENT DB ONLY - run per database; cross-DB refs are the classic Azure SQL DB blocker.
 SELECT
     DB_NAME()                                              AS database_name,
     OBJECT_SCHEMA_NAME(d.referencing_id)                   AS referencing_schema,
@@ -158,8 +173,11 @@ SELECT
     CAST(SUM(CASE WHEN mf.type = 1 THEN mf.size END) * 8.0 / 1048576 AS DECIMAL(18,2)) AS log_size_gb,
     CASE
         WHEN SUM(CASE WHEN mf.type = 0 THEN mf.size END) * 8.0 / 1048576 > 4096
-            THEN '> 4 TB: exceeds GP/BC vCore max -> Azure SQL DB Hyperscale, MI (<=16TB), or VM'
-        ELSE 'Within GP/BC vCore 4 TB limit'
+            THEN '> 4 TB: exceeds Azure SQL DB GP/BC vCore max -> Hyperscale (up to 128 TB), '
+               + 'MI (storage scales w/ vCores & hardware: GP up to 16 TB / 32 TB next-gen, '
+               + 'BC up to 16 TB on premium-series w/ enough vCores), or SQL-on-VM. '
+               + 'Verify current cloud limits on Microsoft Learn.'
+        ELSE 'Within Azure SQL DB GP/BC vCore 4 TB limit'
     END                                                    AS size_target_hint
 FROM sys.master_files AS mf
 WHERE mf.database_id > 4
@@ -168,15 +186,17 @@ ORDER BY data_size_gb DESC;
 
 /*──────────────────────────────────────────────────────────────────────────────
   Section 5: Non-default collation (instance & databases)
-  MI fixes the INSTANCE/tempdb collation at create (SQL_Latin1_General_CP1_CI_AS);
-  a mismatched source instance collation is a known migration gotcha.
+  MI's instance (server) collation is CHOSEN AT CREATION and IMMUTABLE after;
+  the DEFAULT (not a forced value) is SQL_Latin1_General_CP1_CI_AS, and tempdb
+  follows the instance collation. To avoid a known migration gotcha, create the
+  MI with a collation that MATCHES this source instance collation.
 ──────────────────────────────────────────────────────────────────────────────*/
 SELECT
     CONVERT(NVARCHAR(128), SERVERPROPERTY('Collation'))    AS instance_collation,
     CASE
         WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('Collation')) <> 'SQL_Latin1_General_CP1_CI_AS'
-            THEN 'Non-default instance collation - MI tempdb/instance collation is FIXED; plan for collation handling'
-        ELSE 'Default instance collation - matches MI default'
+            THEN 'Non-default instance collation - set the MI instance collation to MATCH this at creation (it cannot be changed later; tempdb inherits it)'
+        ELSE 'Matches the MI default (SQL_Latin1_General_CP1_CI_AS) - still set deliberately at MI creation'
     END                                                    AS collation_note;
 
 SELECT

@@ -13,8 +13,11 @@ The recovery model controls how the transaction log is managed and what restore 
 | **Bulk-logged** | Required | Limited (cannot stop inside a bulk-op interval) | Yes | Only by `BACKUP LOG` |
 
 ```sql
--- Inspect and set the recovery model
+-- Inspect (read-only):
 SELECT name, recovery_model_desc FROM sys.databases ORDER BY name;
+
+-- [CONFIG CHANGE] Confirm DB via DB_NAME(); switching to/from SIMPLE BREAKS the log-backup chain
+-- (take a fresh full afterward). Placeholder [MyDB]. Rollback: SET RECOVERY to the prior model.
 ALTER DATABASE [MyDB] SET RECOVERY FULL;     -- or SIMPLE / BULK_LOGGED
 ```
 
@@ -98,16 +101,18 @@ WITH COMPRESSION, CHECKSUM;
 ### Encrypted backups
 
 ```sql
+-- [SECURITY CHANGE] Creates keys/certs in master. Source every secret from a secret manager;
+-- never commit it, and avoid leaving it in T-SQL/shell history (it lands in plan cache + error logs if mistyped).
 -- One-time: a DMK + server certificate in master
 USE master;
-CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'StrongPwd!';   -- if not present
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>';   -- if not present
 CREATE CERTIFICATE [BackupCert] WITH SUBJECT = N'Backup Encryption Certificate';
 
 -- Back up the certificate AND its private key off-box (critical)
 BACKUP CERTIFICATE [BackupCert]
 TO FILE = N'E:\Keys\BackupCert.cer'
 WITH PRIVATE KEY (FILE = N'E:\Keys\BackupCert.pvk',
-                  ENCRYPTION BY PASSWORD = N'AnotherStrongPwd!');
+                  ENCRYPTION BY PASSWORD = N'<generate-32+char-random-secret>');
 
 -- Now encrypted backups
 BACKUP DATABASE [MyDB] TO DISK = N'E:\Backups\MyDB_Enc.bak'
@@ -115,16 +120,18 @@ WITH COMPRESSION, CHECKSUM,
      ENCRYPTION (ALGORITHM = AES_256, SERVER CERTIFICATE = [BackupCert]);
 ```
 
-For TDE and key-management depth, route to **sqlserver-security**.
+> **This private-key password is required to restore the certificate on another instance.** Lose it and every backup encrypted with that cert is **permanently unrecoverable**. Store the password and the `.cer`/`.pvk` pair in a secret manager / key vault under long retention, separate from the backups themselves, and rotate any value ever pasted from documentation. For TDE and key-management depth, route to **sqlserver-security**.
 
 ### BACKUP TO URL — Azure Blob and S3
 
-**Azure Blob Storage** (2012 SP1+ / 2016+ matured) — back up directly to a blob container via a credential. Block blobs with a SAS token are recommended (max ~12.8 TB striped across 64 URLs on modern versions).
+**Azure Blob Storage** (2012 SP1+ / 2016+ matured) — back up directly to a blob container via a credential. Block blobs with a SAS token are recommended. Size limits (block blob): a **single URL** is capped near **~195.3 GB** (50,000 blocks × 4 MB `MAXTRANSFERSIZE`), and **striping across up to 64 URLs** raises the aggregate ceiling to **~12.8 TB**. Even for smaller backups, stripe to avoid hitting the per-blob block limit. Verify the current single-URL vs striped limits on [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/sql-server-backup-to-url) for your build.
 
 ```sql
--- Credential using a Shared Access Signature (SAS) token
+-- [SECURITY CHANGE] Credential using a Shared Access Signature (SAS) token.
+-- Never commit a real SAS token: scope it (this container, write-only) and give it a short expiry; rotate on exposure.
+-- Source the token from a secret manager — it grants storage access and lands in history/error logs if mishandled.
 CREATE CREDENTIAL [https://myacct.blob.core.windows.net/backups]
-WITH IDENTITY = N'SHARED ACCESS SIGNATURE', SECRET = N'sv=...sig=...';
+WITH IDENTITY = N'SHARED ACCESS SIGNATURE', SECRET = N'<generate-scoped-short-lived-SAS-token>';
 
 BACKUP DATABASE [MyDB]
 TO URL = N'https://myacct.blob.core.windows.net/backups/MyDB_Full.bak'
@@ -134,9 +141,11 @@ WITH COMPRESSION, CHECKSUM, FORMAT, STATS = 5;
 **S3-compatible object storage** — **SQL Server 2022+ only**. Uses the `s3://` scheme with an S3 credential; supports multi-part striping.
 
 ```sql
--- 2022+: credential for an S3 endpoint
+-- [SECURITY CHANGE] 2022+: credential for an S3 endpoint. Use a least-privilege IAM key scoped to this bucket.
+-- Source the access/secret keys from a secret manager; never commit them; rotate on exposure.
 CREATE CREDENTIAL [s3://s3.us-east-1.amazonaws.com/my-bucket]
-WITH IDENTITY = N'S3 Access Key', SECRET = N'<AccessKeyId>:<SecretAccessKey>';
+WITH IDENTITY = N'S3 Access Key',
+     SECRET = N'<access-key-id>:<generate-32+char-random-secret>';
 
 BACKUP DATABASE [MyDB]
 TO URL = N's3://s3.us-east-1.amazonaws.com/my-bucket/MyDB_Full.bak'
@@ -144,6 +153,23 @@ WITH COMPRESSION, CHECKSUM, FORMAT, STATS = 5;   -- 2022+
 ```
 
 > **Platform note:** On **Azure SQL DB/MI** you do not run `BACKUP DATABASE` for operational backups (managed). MI permits `COPY_ONLY` `BACKUP ... TO URL` for export/migration only. On **AWS RDS**, native backup/restore uses `rdsadmin.dbo.rds_backup_database` / `rds_restore_database` to/from S3 — not `BACKUP DATABASE`.
+
+### T-SQL snapshot backup (SQL Server 2022+)
+
+SQL Server 2022 added **T-SQL snapshot backup**, which decouples the storage-vendor snapshot from SQL Server's own metadata. You **freeze** I/O for the database, take a storage/volume snapshot externally, then **thaw** and record the snapshot as a backup whose file holds only metadata (`.bkm`). This makes near-instant backup/restore of very large databases possible without the I/O cost of streaming the data. `METADATA_ONLY` and `SNAPSHOT` are synonyms; `BACKUP GROUP` / `BACKUP SERVER` freeze multiple databases sharing a volume at once.
+
+```sql
+-- [CONFIG CHANGE] Suspends I/O for the DB until you thaw — keep the freeze window very short. Confirm DB via DB_NAME().
+-- 1) Freeze the database (per-DB; ALTER SERVER CONFIGURATION SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON freezes all on a shared disk)
+ALTER DATABASE [MyDB] SET SUSPEND_FOR_SNAPSHOT_BACKUP = ON;
+-- 2) Take the storage/array snapshot of the data + log volumes here (vendor tool / Azure / array).
+-- 3) Record the snapshot as a metadata-only backup (this also thaws the database):
+BACKUP DATABASE [MyDB] TO DISK = N'E:\Backups\MyDB_Snap.bkm' WITH METADATA_ONLY, FORMAT;
+```
+
+### Accelerated Database Recovery (ADR) and the log
+
+**ADR** (SQL Server **2019+**, and Azure SQL DB/MI; all box editions in 2022 per the editions matrix) changes recovery internals so a **long-running or uncommitted transaction no longer pins the log**: the persisted version store (PVS) and a logical-revert mechanism let the log truncate past an open transaction, and instance recovery/rollback becomes near-instant regardless of transaction size. Operationally this defuses the classic "one giant open transaction blew up the log" incident — but ADR's PVS lives **inside the user database** and consumes space, so account for it when sizing. Enabling/disabling ADR is an `ALTER DATABASE ... SET ACCELERATED_DATABASE_RECOVERY` change — see **sqlserver-infrastructure** for sizing/PVS tuning.
 
 ## RPO / RTO Math
 
@@ -161,6 +187,8 @@ Tune the **log interval to hit RPO** and the **diff interval to hit RTO**.
 ### Full → differential → log
 
 ```sql
+-- [DATA-LOSS RISK] WITH REPLACE OVERWRITES the target DB — confirm you are on the right instance/DB first.
+-- Placeholder [MyDB]. (Restore tutorial: stays runnable because the lesson IS the restore sequence.)
 -- Restore full, stay in recovering state
 RESTORE DATABASE [MyDB] FROM DISK = N'E:\Backups\MyDB_Full.bak'
 WITH NORECOVERY, REPLACE;
@@ -180,6 +208,8 @@ RESTORE DATABASE [MyDB] WITH RECOVERY;
 `WITH MOVE` relocates files when restoring to a different path/instance:
 
 ```sql
+-- [DATA-LOSS RISK] WITH REPLACE OVERWRITES the target — confirm instance/DB. Restoring to a *separate* test DB
+-- name (as here) is the safe pattern for a restore-test; placeholder [MyDB_Test].
 RESTORE DATABASE [MyDB_Test] FROM DISK = N'E:\Backups\MyDB_Full.bak'
 WITH MOVE N'MyDB'     TO N'E:\Data\MyDB_Test.mdf',
      MOVE N'MyDB_log' TO N'L:\Log\MyDB_Test_log.ldf',
@@ -206,6 +236,7 @@ Then restore it last (before final `WITH RECOVERY`) as the most recent log in th
 To recover to a moment (e.g., just before an accidental `DELETE`), replay logs and stop at the timestamp on the log that contains it:
 
 ```sql
+-- [DATA-LOSS RISK] WITH REPLACE OVERWRITES the target DB — confirm instance/DB. Placeholder [MyDB].
 RESTORE DATABASE [MyDB] FROM DISK = N'E:\Backups\MyDB_Full.bak' WITH NORECOVERY, REPLACE;
 RESTORE LOG [MyDB] FROM DISK = N'E:\Backups\MyDB_Log_1.trn' WITH NORECOVERY;
 RESTORE LOG [MyDB] FROM DISK = N'E:\Backups\MyDB_Log_2.trn'
@@ -221,6 +252,7 @@ WITH STOPAT = N'2026-05-27T14:31:59', RECOVERY;
 When only a few pages are corrupt (and the rest of the DB is fine), restore just those pages instead of the whole database. Online page restore is **Enterprise**; offline on Standard. Requires Full/Bulk-logged and the full log chain since the page was last good.
 
 ```sql
+-- [DATA-LOSS RISK] Modifies the live DB (replaces the named pages) — confirm instance/DB. Placeholder [MyDB].
 RESTORE DATABASE [MyDB] PAGE = N'1:57613, 1:57614'
 FROM DISK = N'E:\Backups\MyDB_Full.bak' WITH NORECOVERY;
 RESTORE LOG [MyDB] FROM DISK = N'E:\Backups\MyDB_Log_1.trn' WITH NORECOVERY;
@@ -254,6 +286,8 @@ RESTORE FILELISTONLY FROM DISK = N'E:\Backups\MyDB_Full.bak';
 ```
 
 **The only true validation is a test restore.** Periodically (monthly is common; quarterly minimum for a full DR drill) restore to a scratch instance and run `DBCC CHECKDB` on the result. Automate this and alert on failure. An untested backup is not a backup.
+
+> **Community tools.** The Brent Ozar First Responder Kit (MIT) adds two backup-focused procs: **`sp_BlitzBackups`** estimates real **RPO/RTO from `msdb` backup history** (read-only — a fast check that cadence meets target), and **`sp_DatabaseRestore`** scripts a multi-file restore and pairs with Ola `DatabaseBackup` output (**mutating — [DATA-LOSS RISK]**; confirm target instance/DB). Installing the kit is a **[CONFIG CHANGE]** (objects in a utility DB). See **sqlserver-monitoring** for the full catalog.
 
 ## The 3-2-1 Rule
 

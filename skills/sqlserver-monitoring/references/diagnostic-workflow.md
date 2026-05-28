@@ -38,6 +38,8 @@ Only after step 1 do you know how to sort. `PAGEIOLATCH`/I/O waits → sort `sys
 
 Now and only now do you open a single query's plan: estimated vs actual rows (cardinality error), spill warnings (under-granted memory), scans where seeks are expected (missing/unusable index), and implicit conversions. Deep plan reading and fixes belong to `sqlserver-engineering`.
 
+For a query that is **still running** and you cannot wait for it to finish, `sys.dm_exec_query_profiles` exposes **live per-operator actual row counts** for the in-flight statement — the engine behind SSMS "Live Query Statistics." Compare its running `row_count` to the operator's `estimate_row_count` to catch a cardinality blow-up in real time (e.g. a nested-loop driving far more rows than estimated). It is fed by the **lightweight query profiling infrastructure**, which is **default-on in SQL Server 2019+** (and Azure SQL DB/MI). On 2016 SP1+/2017 it is opt-in: enable trace flag **7412** (instance-wide) or run a `query_thread_profile` Extended Events session; on 2019+ TF 7412 has no effect. (You can disable it per database via the `LIGHTWEIGHT_QUERY_PROFILING` database-scoped configuration. Verify version/flag details on Microsoft Learn for your build.)
+
 ### Step 5 — Configuration
 
 Last, because it reshapes everything above: MAXDOP, cost threshold for parallelism, max/min server memory, tempdb file count, RCSI, trace flags. Changing these belongs to `sqlserver-infrastructure`; this skill only flags when a setting is the likely amplifier.
@@ -53,15 +55,33 @@ Every wait splits into two phases:
 
 **High signal wait % (rule of thumb > ~20–25% of total) indicates CPU pressure** — tasks are ready but cannot get on a scheduler. This is corroborating evidence for `SOS_SCHEDULER_YIELD` and runnable-queue depth. Low signal % with high resource time means the bottleneck is genuinely the resource (disk, lock, memory).
 
+Compute the ratio **over the same benign/idle-wait filter** used below. Idle waits (lazy-writer/broker/XE sleeps) carry large *resource* time and almost no *signal* time, so including them deflates `signal_wait_pct` and **understates real CPU pressure**. Filter first, then take the ratio:
+
 ```sql
 -- Overall signal-wait ratio across the instance (CPU-pressure indicator)
+-- Filter benign/idle waits FIRST — the unfiltered ratio understates CPU pressure.
+;WITH w AS
+(
+    SELECT signal_wait_time_ms, wait_time_ms
+    FROM sys.dm_os_wait_stats
+    WHERE waiting_tasks_count > 0
+      AND wait_type NOT IN
+      (   -- abbreviated benign list; use the comprehensive filter below for production
+          N'SLEEP_TASK', N'SLEEP_SYSTEMTASK', N'LAZYWRITER_SLEEP', N'WAITFOR',
+          N'XE_TIMER_EVENT', N'XE_DISPATCHER_WAIT', N'DIRTY_PAGE_POLL',
+          N'CHECKPOINT_QUEUE', N'LOGMGR_QUEUE', N'REQUEST_FOR_DEADLOCK_SEARCH',
+          N'BROKER_TO_FLUSH', N'BROKER_TASK_STOP', N'BROKER_RECEIVE_WAITFOR',
+          N'SP_SERVER_DIAGNOSTICS_SLEEP', N'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
+          N'QDS_ASYNC_QUEUE', N'HADR_FILESTREAM_IOMGR_IOCOMPLETION',
+          N'DISPATCHER_QUEUE_SEMAPHORE', N'SOS_WORK_DISPATCHER'
+      )
+)
 SELECT
     CAST(100.0 * SUM(signal_wait_time_ms) / NULLIF(SUM(wait_time_ms), 0) AS DECIMAL(5,2))
         AS signal_wait_pct,   -- elevated => CPU / scheduler pressure
     CAST(100.0 * SUM(wait_time_ms - signal_wait_time_ms) / NULLIF(SUM(wait_time_ms), 0) AS DECIMAL(5,2))
         AS resource_wait_pct
-FROM sys.dm_os_wait_stats
-WHERE waiting_tasks_count > 0;
+FROM w;
 ```
 
 ---
@@ -194,6 +214,8 @@ ORDER BY fw.wait_time_ms DESC;
 | `IO_COMPLETION` / `ASYNC_IO_COMPLETION` | Disk I/O | Non-buffer I/O: backups, sorts spilling, eager writes, file growth | I/O latency; autogrowth events; backup throughput (`sqlserver-operations`) |
 | `BACKUPIO` / `BACKUPBUFFER` | Backup I/O | Backup target throughput | Backup tuning (`sqlserver-operations`) |
 
+> **`THREADPOOL` lifeline — the DAC.** When workers are exhausted, *new normal connections cannot even log in* (the login itself needs a worker), so you may be locked out exactly when you need to diagnose. The **Dedicated Admin Connection (DAC)** runs on its own reserved scheduler/memory and is the way in. The **local DAC is always available** on the instance; connect with `sqlcmd -A` or, in SSMS, the `ADMIN:` server prefix (`ADMIN:ServerName`), then run the live blocking/scheduler DMVs to find the head blocker consuming workers. The **remote DAC is off by default** and must be enabled (`sp_configure 'remote admin connections', 1`); the harmonized plugin stance is to leave remote DAC disabled unless a documented operational need justifies it and it is firewalled to admins only — see `sqlserver-infrastructure`/`sqlserver-security`. Only one DAC session is allowed at a time, and don't run heavy queries over it.
+
 ---
 
 ## Per-Session Waits (2016+)
@@ -271,3 +293,9 @@ Symptom: "the app is slow in the afternoon."
 5. **Hand off to `sqlserver-engineering`** to design a proper covering index (not the raw suggestion), and to `sqlserver-infrastructure` if `max server memory` is set too low for the data size.
 
 Notice each step eliminated whole subsystems (CPU, locking, network) before touching a plan.
+
+---
+
+## Optional: community tools that accelerate this workflow
+
+The bundled read-only scripts cover every step above with no dependencies. Where you are allowed to install community tooling, Brent Ozar's First Responder Kit (`sp_BlitzFirst`/`sp_BlitzWho` at "right now," `sp_BlitzCache` at top queries, `sp_BlitzLock` at deadlocks) and Erik Darling's PerformanceMonitor (continuous historical baselining) map directly onto this five-step method and can speed triage. They **complement, not replace** the waits-first discipline and the bundled scripts. See `references/community-diagnostic-tools.md` for the mapping, install pointers, and change-class/safety notes.

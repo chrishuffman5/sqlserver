@@ -15,9 +15,9 @@ SQL Server's memory is not one pool; it is many clerks. The major regions:
 | **Buffer pool** | Data and index **pages** (8 KB each) read from disk | Usually the largest consumer; the cache that makes SQL fast |
 | **Plan cache** | Compiled execution plans (`CACHESTORE_SQLCP`, `CACHESTORE_OBJCP`) | Bloats with single-use ad-hoc plans → `optimize for ad hoc workloads` |
 | **Query workspace memory** | **Memory grants** for Sort, Hash Match/Join, and other operators | Under-grant → spill to tempdb (slow); over-grant → wasted reservation, limited concurrency |
-| **Lock memory** | Lock-manager structures for concurrency control | Grows with lock count; escalation curbs runaway growth |
+| **Lock memory** | Lock-manager structures for concurrency control | Grows with lock count; escalation curbs runaway growth. **Optimized locking** (SQL Server 2025 / Azure SQL DB/MI; requires ADR) holds far fewer locks per transaction, materially reducing lock memory and escalation |
 | **CLR** | .NET runtime + CLR object memory | Only relevant when `clr enabled = 1` |
-| **Thread stacks** | One stack per worker thread | ~512 KB/thread on x64; scales with `max worker threads` |
+| **Thread stacks** | One stack per worker thread | 2 MB/thread on x64 (512 KB on x86); scales with `max worker threads` |
 | **In-Memory OLTP** | Memory-optimized table rows + indexes | Lives outside the buffer pool; bound by `max server memory` (2016+) and resource-pool limits |
 | **Column store object pool** | Columnstore segments/dictionaries | Relevant for analytical/HTAP workloads |
 
@@ -137,10 +137,17 @@ FROM   sys.dm_os_memory_nodes;
 
 ### Automatic soft-NUMA (2016+)
 
-When a hardware NUMA node (or a non-NUMA socket) has **more than 8 physical cores**, SQL Server **2016+** automatically partitions it into **soft-NUMA** nodes (≤ 8 cores each) to reduce contention on per-node structures (e.g., the lazywriter and partitioned data structures). It is **on by default**; the extra nodes show in `sys.dm_os_nodes` with a "SOFT-NUMA" indication.
+When a hardware NUMA node (or a non-NUMA socket) has **more than 8 physical cores**, SQL Server **2016+** automatically partitions it into **soft-NUMA** nodes to reduce contention on per-node structures (e.g., the lazywriter and partitioned data structures). The engine aims for **8 cores per soft node** but may use **as few as 4 or as many as 8**; simultaneous multithreading (SMT/hyperthread) cores are **not** counted when measuring physical cores per node. It is **on by default**; the extra nodes show in `sys.dm_os_nodes` (and `sys.dm_os_sys_info.softnuma_configuration`).
 
-- Automatic soft-NUMA generally helps high-core-count single-socket servers; leave it on unless you have a specific reason and measurements to disable it (`ALTER SERVER CONFIGURATION SET SOFTNUMA = OFF;`, restart required).
-- Soft-NUMA changes how schedulers group but does **not** change physical memory locality.
+- Automatic soft-NUMA generally helps high-core-count single-socket servers; leave it on unless you have a specific reason and measurements to disable it.
+
+```sql
+-- [CONFIG CHANGE] disabling automatic soft-NUMA — REQUIRES A SERVICE RESTART to take effect. Confirm the target instance.
+-- Rollback: ALTER SERVER CONFIGURATION SET SOFTNUMA = ON; (restart again). Verify default behavior on Microsoft Learn for your build.
+-- ALTER SERVER CONFIGURATION SET SOFTNUMA = OFF;
+```
+
+- Soft-NUMA changes how **schedulers group** but does **not** change physical memory locality (it cannot move memory between hardware nodes).
 
 ---
 
@@ -167,7 +174,7 @@ A persistently high `runnable_tasks` count across schedulers = CPU pressure (mor
 
 ### Worker threads
 
-Each scheduler draws workers from a pool sized by `max worker threads` (`0` = auto; see `instance-configuration.md`). `THREADPOOL` waits mean the pool is exhausted — almost always a *symptom* of long blocking, not a reason to raise the thread count. Raising it just costs ~512 KB of stack per thread and delays the real fix.
+Each scheduler draws workers from a pool sized by `max worker threads` (`0` = auto; see `instance-configuration.md`). `THREADPOOL` waits mean the pool is exhausted — almost always a *symptom* of long blocking, not a reason to raise the thread count. Raising it just costs ~2 MB of stack per thread (x64) and delays the real fix.
 
 ### MAXDOP relative to physical cores per NUMA node
 

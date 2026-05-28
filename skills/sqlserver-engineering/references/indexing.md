@@ -27,7 +27,7 @@ A nonclustered index (NCI) is a separate B-tree whose leaf level holds the **key
 
 This is why the clustered key's width matters everywhere, and why a narrow clustered key keeps NCIs lean. When a query needs columns *not* in the NCI, the engine performs a **Key Lookup** (clustered) or **RID Lookup** (heap) — one random read per qualifying row (§4).
 
-Limits: up to **999 nonclustered indexes** per table; key ≤ 16 columns / 900 bytes (1700 for a nonclustered index on 2016+); `INCLUDE` columns don't count against the key size limit.
+Limits (verify on Microsoft Learn for your build): up to **999 nonclustered indexes** per table; an index key can have up to **32 key columns**. **Key byte size:** a **clustered** key ≤ **900 bytes**; a **nonclustered** key ≤ **1,700 bytes on 2016+** (it was 900 for all index types on 2014 and earlier). `INCLUDE` columns count against neither the column-count nor the byte limit — use them to escape the key-size ceiling and to cover wide SELECT lists.
 
 ---
 
@@ -41,10 +41,12 @@ A **covering index** contains every column a query touches, so the query is sati
 - can be types disallowed in keys (e.g. `nvarchar(max)`, up to the LOB rules).
 
 ```sql
--- Query: SELECT C, D FROM T WHERE A = @a AND B > @b
+-- [SCHEMA CHANGE] Query: SELECT C, D FROM T WHERE A = @a AND B > @b
+-- Creating an index is size-of-data; OFFLINE create takes a Sch-M lock (ONLINE = ON is
+-- Enterprise/Azure-only). Confirm target DB and use a maintenance window for large tables.
 CREATE NONCLUSTERED INDEX IX_T_A_B_inc_C_D
-    ON dbo.T (A, B)        -- key: equality (A) before range (B)
-    INCLUDE (C, D);        -- payload: covers the SELECT list
+    ON dbo.[MyDB_Table] (A, B)   -- key: equality (A) before range (B)
+    INCLUDE (C, D);              -- payload: covers the SELECT list
 ```
 
 **Key-column ordering rule:** put **equality** predicate columns first (in selectivity order), then **range** predicate columns, then columns needed only for `ORDER BY`. A range predicate "stops" the usefulness of subsequent key columns for seeking, so a range column should be last among seekable keys.
@@ -62,10 +64,13 @@ A **Key Lookup** appears when a nonclustered index is selective enough to be cho
 - If the missing column is in a residual predicate / `ORDER BY` that should seek → add it to the **key**.
 
 ```sql
--- Plan shows: Index Seek (IX_T_A) -> Key Lookup (PK) for column D
--- Fix: include D so the index covers the query
-CREATE NONCLUSTERED INDEX IX_T_A ON dbo.T (A) INCLUDE (D)
-    WITH (DROP_EXISTING = ON);
+-- [SCHEMA CHANGE] Plan shows: Index Seek (IX_T_A) -> Key Lookup (PK) for column D
+-- Fix: include D so the index covers the query. Size-of-data + log-heavy; an OFFLINE rebuild
+-- takes a Sch-M lock that BLOCKS the table. ONLINE = ON is Enterprise-only (also Developer/Eval;
+-- the Azure SQL DB/MI engine supports it) — on Standard this runs OFFLINE. Confirm target DB
+-- (SELECT DB_NAME()) and run in an approved maintenance window.
+CREATE NONCLUSTERED INDEX IX_T_A ON dbo.[MyDB_Table] (A) INCLUDE (D)
+    WITH (DROP_EXISTING = ON);   -- add ONLINE = ON only on Enterprise/Azure to avoid the Sch-M block
 ```
 
 Use `scripts/05-plan-cache-analysis.sql` to surface plans with lookups and missing-index warnings.
@@ -77,8 +82,10 @@ Use `scripts/05-plan-cache-analysis.sql` to surface plans with lookups and missi
 A **filtered index** indexes only the rows matching a `WHERE` predicate — smaller, cheaper to maintain, and statistics are more accurate for that subset. Ideal for sparse/soft-delete/status-subset patterns:
 
 ```sql
+-- [SCHEMA CHANGE] size-of-data create; OFFLINE takes a Sch-M lock (ONLINE = ON Enterprise/Azure-only).
+-- Confirm target DB (SELECT DB_NAME()) and run large builds in an approved maintenance window.
 CREATE NONCLUSTERED INDEX IX_Order_Open
-    ON dbo.[Order] (CustomerID, OrderDate)
+    ON dbo.[MyDB_Order] (CustomerID, OrderDate)
     INCLUDE (Amount)
     WHERE Status = 'Open';        -- only the hot, small subset is indexed
 ```
@@ -123,6 +130,8 @@ Declare an index **unique** whenever the data is unique. Beyond enforcing integr
 - **`FILLFACTOR`** leaves free space in leaf pages at build/rebuild time so in-place inserts/updates don't immediately split. `FILLFACTOR = 100` (default, =0) packs pages full — ideal for **ever-increasing** keys (appends never split mid-index) but bad for keys with random/mid-range inserts.
 - For random-insert indexes (e.g. a GUID key you can't change), a lower fill factor (e.g. 80–90) reduces splits at the cost of more pages / lower buffer-pool density. **Tuning fill factor and scheduling rebuilds/reorgs is an operations concern → `sqlserver-operations`.** Design-time guidance: fix the *key* (make it monotonic) before reaching for a low fill factor.
 
+> **Edition gate for rebuilds:** `REBUILD WITH (ONLINE = ON)` is **Enterprise-only** (also Developer/Evaluation; the Azure SQL DB/MI engine supports it) across **all** box versions 2016–2025 — Standard **never** gained it. On Standard, `REBUILD` is **OFFLINE** (takes a Sch-M lock that blocks the table), so default to `REORGANIZE` (always online, any edition) or a scheduled OFFLINE rebuild in an approved window. **RESUMABLE** rebuild requires `ONLINE = ON` (so it's Enterprise-gated on box); resumable *create* is 2019+.
+
 ---
 
 ## 9. Missing-Index DMVs — Use, Don't Obey
@@ -153,7 +162,11 @@ Memory-optimized tables (see `schema-design.md`) use index structures that live 
 
 - **Hash index** — O(1) **equality** lookups only (no range/order). Critically, you must size **`BUCKET_COUNT`** to ~1–2× the number of *distinct* key values:
   ```sql
-  ALTER TABLE dbo.Session ADD INDEX IX_Session_Token
+  -- [SCHEMA CHANGE] Adding an index to a memory-optimized table is a size-of-data rebuild that
+  -- takes a Sch-M lock blocking the table while it runs; confirm target DB (SELECT DB_NAME()) and
+  -- run in an approved maintenance window. (In-Memory OLTP needs a memory-optimized filegroup +
+  -- Enterprise on box / Business Critical|Premium on Azure.)
+  ALTER TABLE dbo.[MyDB_Session] ADD INDEX IX_Session_Token
       HASH (Token) WITH (BUCKET_COUNT = 1000000);
   ```
   Too few buckets → long hash chains (collisions) → slow lookups; too many → wasted memory. Hash indexes are useless for range predicates and `ORDER BY`.
@@ -169,3 +182,4 @@ Pick **hash** for high-volume point lookups on a unique-ish key with a well-know
 - Clustered-key data-type choices, partition-aligned indexes, computed-column indexing: `schema-design.md`.
 - Rebuild/reorganize automation, fill-factor jobs, fragmentation maintenance: **`sqlserver-operations`**.
 - Live latch/lock contention on hot indexes: **`sqlserver-monitoring`**.
+- **Community tooling (read-only):** Brent Ozar's **`sp_BlitzIndex`** consolidates missing/unused/duplicate/overly-wide index findings and flags heaps (`@Mode = 4` for detail) — a fast first pass before hand-running `scripts/01/02/04`. Install/usage and safety notes live in the community-tools section of **`sqlserver-monitoring`**.

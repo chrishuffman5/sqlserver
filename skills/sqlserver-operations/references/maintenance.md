@@ -14,7 +14,7 @@ Two kinds: **logical/external fragmentation** (leaf pages out of physical order 
 |---|---|---|---|
 | < 10% | None | — | — |
 | 10–30% | Reorganize | `ALTER INDEX … REORGANIZE` | Always online, minimally logged, interruptible (keeps work done) |
-| > 30% | Rebuild | `ALTER INDEX … REBUILD` | Offline by default; ONLINE with edition support; fully logged unless Bulk-logged |
+| > 30% | Rebuild | `ALTER INDEX … REBUILD` | OFFLINE by default; `ONLINE = ON` is **Enterprise-only** (Developer/Evaluation/Azure SQL too) on all box versions; fully logged unless Bulk-logged |
 
 These are guidelines, not laws. For some workloads, updating statistics matters more than defragmenting; for ever-increasing clustered keys with append-only inserts, fragmentation barely accrues.
 
@@ -48,9 +48,10 @@ Use `LIMITED` (cheapest, reads only level above leaf), `SAMPLED`, or `DETAILED` 
 ### Reorganize
 
 ```sql
-ALTER INDEX [IX_Orders_CustomerId] ON dbo.Orders REORGANIZE;
+-- [PERFORMANCE CHANGE] Always online + interruptible; safe in business hours but still logs work. Confirm DB via DB_NAME().
+ALTER INDEX [IX_Orders_CustomerId] ON [dbo].[Orders] REORGANIZE;
 -- Compact LOB pages too:
-ALTER INDEX ALL ON dbo.Orders REORGANIZE WITH (LOB_COMPACTION = ON);
+ALTER INDEX ALL ON [dbo].[Orders] REORGANIZE WITH (LOB_COMPACTION = ON);
 ```
 
 Reorganize is always online and minimally logged, and is safely interruptible — it keeps the reordering done so far. It uses the existing `FILLFACTOR`; it does not change it.
@@ -58,11 +59,13 @@ Reorganize is always online and minimally logged, and is safely interruptible �
 ### Rebuild
 
 ```sql
--- Basic offline rebuild (recreates the index; resets fill factor; updates stats with FULLSCAN as a side effect)
-ALTER INDEX [IX_Orders_CustomerId] ON dbo.Orders REBUILD WITH (FILLFACTOR = 90);
+-- [PERFORMANCE CHANGE] Confirm DB via DB_NAME(); run blocking/size-of-data ops only in an approved window.
+-- Basic OFFLINE rebuild (recreates the index; resets fill factor; updates stats with FULLSCAN as a side effect).
+-- OFFLINE holds a schema-modification lock for the whole operation — this is the only mode on Standard.
+ALTER INDEX [IX_Orders_CustomerId] ON [dbo].[Orders] REBUILD WITH (FILLFACTOR = 90);
 
--- Online + resumable, with a time box
-ALTER INDEX [IX_Orders_CustomerId] ON dbo.Orders
+-- Online + resumable, with a time box (Enterprise/Developer/Evaluation or Azure SQL only — see edition gates below)
+ALTER INDEX [IX_Orders_CustomerId] ON [dbo].[Orders]
 REBUILD WITH (ONLINE = ON, RESUMABLE = ON, FILLFACTOR = 90, MAX_DURATION = 90 MINUTES);
 ```
 
@@ -70,18 +73,40 @@ A rebuild fully recreates the index. Online rebuilds use extra space (a shadow c
 
 #### Edition / version gates
 
-- **ONLINE rebuild**: Enterprise on 2016–2019. **Standard gained ONLINE index rebuild in 2019+** (with caveats), and it is broadly available in **2022+**. Always verify for the exact build/edition. `ONLINE` cannot be used when the index has certain LOB columns on older versions.
-- **RESUMABLE rebuild**: **2017+** (and Azure SQL DB). Resumable lets you `PAUSE`/`RESUME`/`ABORT` and survive failovers, processing in chunks:
+- **ONLINE index create/rebuild (`ONLINE = ON`)**: **Enterprise-only** (also Developer/Evaluation; the Azure SQL DB/MI engine supports it) across **all box versions 2016–2025**. **Standard never gained it** — on Standard, `REBUILD` is always OFFLINE (holds a schema-modification lock throughout), so default to `REORGANIZE` (always online) or schedule an OFFLINE rebuild inside an approved window. Online rebuild of LOB-containing indexes has been supported **since SQL Server 2012** — there is no longer a LOB exclusion to worry about on supported versions. Verify on the [Microsoft Learn editions/features page](https://learn.microsoft.com/en-us/sql/sql-server/editions-and-components-of-sql-server-2022) for your build.
+- **Detect the edition before choosing** a strategy so a script doesn't fail on Standard:
 
   ```sql
-  ALTER INDEX [IX_Big] ON dbo.BigTable PAUSE;
-  ALTER INDEX [IX_Big] ON dbo.BigTable RESUME;
-  ALTER INDEX [IX_Big] ON dbo.BigTable ABORT;
-  -- Monitor resumable operations:
+  -- Read-only: returns 3 = Enterprise/Developer/Evaluation (ONLINE supported), 2 = Standard (no ONLINE),
+  -- 5 = Azure SQL DB, 8 = Managed Instance.
+  SELECT SERVERPROPERTY('EngineEdition') AS engine_edition,
+         SERVERPROPERTY('Edition')       AS edition;
+  ```
+
+- **RESUMABLE rebuild requires `ONLINE = ON`**, so on the box product it is **Enterprise-gated** (available since 2017; also Azure SQL). Resumable lets you `PAUSE`/`RESUME`/`ABORT` and survive failovers, processing in chunks:
+
+  ```sql
+  -- [PERFORMANCE CHANGE] Resumable control; Enterprise/Developer/Evaluation or Azure SQL only.
+  ALTER INDEX [IX_Big] ON [dbo].[BigTable] PAUSE;
+  ALTER INDEX [IX_Big] ON [dbo].[BigTable] RESUME;
+  ALTER INDEX [IX_Big] ON [dbo].[BigTable] ABORT;
+  -- Monitor resumable operations (read-only):
   SELECT * FROM sys.index_resumable_operations;
   ```
 
-- **RESUMABLE create** (`CREATE INDEX ... WITH (RESUMABLE = ON)`): **2019+**.
+- **RESUMABLE create** (`CREATE INDEX ... WITH (RESUMABLE = ON)`): **2019+** (still requires `ONLINE = ON`, so Enterprise-gated on box).
+
+#### Making online rebuilds production-safe: WAIT_AT_LOW_PRIORITY
+
+An online rebuild still needs a brief Sch-M lock at start and finish; under concurrency that lock can block (or be blocked) and cause a stall. `WAIT_AT_LOW_PRIORITY` bounds that risk — wait up to `MAX_DURATION` minutes for the lock, then take a defined action:
+
+```sql
+-- [PERFORMANCE CHANGE] Enterprise/Developer/Evaluation or Azure SQL. Confirm DB via DB_NAME(); approved window only.
+ALTER INDEX [IX_Orders_CustomerId] ON [dbo].[Orders]
+REBUILD WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 5 MINUTES, ABORT_AFTER_WAIT = SELF)),
+              RESUMABLE = ON, FILLFACTOR = 90);
+-- ABORT_AFTER_WAIT: SELF = abort the rebuild; BLOCKERS = kill the sessions blocking it (needs ALTER ANY CONNECTION); NONE = keep waiting.
+```
 
 ### Fill factor
 
@@ -90,6 +115,20 @@ Fill factor reserves free space on leaf pages at build time to absorb future ins
 ### Heaps
 
 Heaps (no clustered index) can become bloated by forwarded records. `ALTER TABLE … REBUILD` rebuilds a heap, but the better long-term fix is usually to add an appropriate clustered index — see **sqlserver-engineering** for clustered-key design.
+
+### Columnstore indexes (different model)
+
+The rowstore 10%/30% `avg_fragmentation_in_percent` thresholds **do not apply** to columnstore indexes — that column is meaningless for them. Columnstore "fragmentation" is about open/small **rowgroups**: rows sitting in the deltastore (open or closed but not yet compressed) and rowgroups left small or bloated by deletes. The health signal is `sys.dm_db_column_store_row_group_physical_stats` (rows per rowgroup, `deleted_rows`, `state_desc`). Maintain with `REORGANIZE` rather than chasing a fragmentation percent:
+
+```sql
+-- [PERFORMANCE CHANGE] Confirm DB via DB_NAME(); approved window for the COMPRESS variant (it rewrites rowgroups).
+-- Merge/compress closed deltastores online (tuple mover work, on demand):
+ALTER INDEX [CCI_Sales] ON [dbo].[Sales] REORGANIZE;
+-- Force ALL rowgroups (including small OPEN ones) to compress — heavier, do in the window:
+ALTER INDEX [CCI_Sales] ON [dbo].[Sales] REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON);
+```
+
+Reserve a full `REBUILD` for when many rowgroups have high `deleted_rows`. Ola's `IndexOptimize` understands columnstore (it switches to rowgroup-based logic) — let it decide rather than applying rowstore thresholds.
 
 ## Statistics Maintenance
 
@@ -101,6 +140,7 @@ Statistics feed the optimizer's cardinality estimates. Stale or poorly sampled s
 - Enable **`AUTO_UPDATE_STATISTICS_ASYNC`** for OLTP so the triggering query doesn't stall waiting for the stats update (the update runs in the background; that query uses the old stats once).
 
   ```sql
+  -- [CONFIG CHANGE] Confirm DB via DB_NAME(); database-scoped, takes effect immediately. Rollback: SET ... OFF.
   ALTER DATABASE [MyDB] SET AUTO_UPDATE_STATISTICS_ASYNC ON;
   ```
 
@@ -109,11 +149,12 @@ Statistics feed the optimizer's cardinality estimates. Stale or poorly sampled s
 ### Manual updates
 
 ```sql
+-- [PERFORMANCE CHANGE] Confirm DB via DB_NAME(); FULLSCAN is heavy — run important large tables in the window.
 -- Full scan: most accurate, most expensive — use for important large tables in the window
-UPDATE STATISTICS dbo.Orders WITH FULLSCAN;
+UPDATE STATISTICS [dbo].[Orders] WITH FULLSCAN;
 
 -- Specific statistic, sampled
-UPDATE STATISTICS dbo.Orders [IX_Orders_OrderDate] WITH SAMPLE 50 PERCENT;
+UPDATE STATISTICS [dbo].[Orders] [IX_Orders_OrderDate] WITH SAMPLE 50 PERCENT;
 
 -- All stats in a DB (Ola's IndexOptimize / sp_updatestats do this intelligently)
 EXEC sp_updatestats;
@@ -175,17 +216,33 @@ When CHECKDB reports errors:
 4. **Restore from backup — the correct fix.** If you have a good chain:
    - **Page restore** for a small number of corrupt pages (Enterprise online / Standard offline) — minimal downtime, zero data loss. See `backup-recovery.md`.
    - **Full restore + log roll-forward + tail-log** to recover the database with zero data loss.
-5. **`REPAIR_ALLOW_DATA_LOSS` is the last resort.** It is *not* a fix — it makes the database *consistent again* by **deallocating the corrupt pages and the data on them**. Requires `SINGLE_USER`. Procedure:
-   - Take a backup of the corrupt database first (so you can try other recovery later).
-   - `ALTER DATABASE [MyDB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;`
-   - `DBCC CHECKDB ([MyDB], REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;`
-   - `ALTER DATABASE [MyDB] SET MULTI_USER;`
-   - Re-run `DBCC CHECKDB` to confirm clean, then **figure out what data was lost** (restore a copy elsewhere to compare) and reconcile.
-   - `REPAIR_REBUILD` (no data loss) only fixes minor nonclustered-index issues — try it before the data-loss option when applicable.
+5. **`REPAIR_ALLOW_DATA_LOSS` is the last resort — [DATA-LOSS RISK].** It is *not* a fix — it makes the database *consistent again* by **deallocating the corrupt pages and the data on them** (and `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` rolls back every in-flight transaction). Use it **only** when there is no usable backup. `REPAIR_REBUILD` (no data loss) fixes only minor nonclustered-index issues — try it first when applicable.
+
+   **Pre-flight checklist (complete every item before running anything below):**
+   - [ ] Confirm you are on the correct instance and database (`SELECT @@SERVERNAME, DB_NAME();`); the target DB below is referenced as `[CONFIRM_DB]`.
+   - [ ] **Back up the corrupt database first** (even corrupt) so other recovery paths remain open afterward.
+   - [ ] Confirm there is genuinely **no usable backup chain** for a restore or page restore — restore is always preferred to REPAIR.
+   - [ ] Understand that **some corruption is unrepairable** (certain system-table, PFS/GAM/allocation damage) and will force a restore regardless.
+   - [ ] Obtain **documented business approval** for accepted data loss; freeze/redirect the application.
+   - [ ] Name the **post-repair reconciliation owner** (who compares against a restored copy and recovers lost rows).
+
+   The following is a **runbook TEMPLATE, not runnable SQL** — uncomment, replace `[CONFIRM_DB]`, and run line by line only after the checklist is signed off:
+
+   ```sql
+   -- [DATA-LOSS RISK] REPAIR DEALLOCATES (DESTROYS) DATA ON CORRUPT PAGES. Last resort only.
+   -- 1) BACKUP DATABASE [CONFIRM_DB] TO DISK = N'...corrupt_prerepair.bak' WITH CHECKSUM, COPY_ONLY;
+   -- 2) ALTER DATABASE [CONFIRM_DB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;  -- rolls back all open tx
+   -- 3) DBCC CHECKDB ([CONFIRM_DB], REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;
+   -- 4) ALTER DATABASE [CONFIRM_DB] SET MULTI_USER;
+   -- 5) DBCC CHECKDB ([CONFIRM_DB]) WITH NO_INFOMSGS, ALL_ERRORMSGS;  -- confirm clean
+   -- 6) Reconcile lost rows against a restored copy elsewhere.
+   ```
 6. **Root-cause the storage.** A repair/restore that doesn't fix the failing disk just buys time until the next corruption.
 
+**REPAIR limitations (why restore beats repair):** `REPAIR_ALLOW_DATA_LOSS` only restores *physical/logical consistency* — it does **not** recover the data on deallocated pages, cannot reverse FK/business-rule violations it introduces, and **cannot repair some structures at all** (PFS/GAM/SGAM allocation pages, critical system tables, and certain metadata damage), which force a restore regardless. It is also not minimally logged and runs single-user. Treat it strictly as the option of last resort after every restore path is exhausted.
+
 ```sql
--- Pages flagged as suspect (corruption history)
+-- Pages flagged as suspect (corruption history) — read-only
 SELECT DB_NAME(database_id) AS database_name, file_id, page_id,
        event_type,   -- 1=823/824, 2=bad checksum, 3=torn page, 4=restored, 5=repaired, 7=deallocated
        error_count, last_update_date

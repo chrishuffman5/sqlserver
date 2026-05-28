@@ -14,7 +14,7 @@ Apply SQL Server-specific reasoning, never generic database advice. Always confi
 
 ## How to Approach a Security Request
 
-1. **Establish version and platform first.** TDE for all editions is 2019+; Always Encrypted is 2016+ and secure enclaves are 2019+; ledger and strict TLS / TDS 8.0 are 2022+; RLS and DDM are 2016+. On **Azure SQL Database** there is no Windows authentication, no instance-level logins, no `xp_cmdshell`, and key management is via Azure Key Vault / Entra ID. On **Azure SQL MI** the surface is much closer to the box but still no Windows auth (Entra ID replaces it). On **AWS RDS** there is no `sa`, no true `sysadmin`, and OS-level features are blocked.
+1. **Establish version and platform first.** TDE is Enterprise/Developer historically and Standard/Web/Express from 2019; Always Encrypted is 2016+ and secure enclaves are 2019+ (box uses VBS enclaves with HGS attestation); ledger and strict TLS / TDS 8.0 are 2022+; RLS and DDM are 2016+. On **Azure SQL Database** there is no Windows authentication, no instance-level logins, no `xp_cmdshell`, and key management is via Azure Key Vault / Entra ID. On **Azure SQL MI** the surface is much closer to the box but still no Windows auth (Entra ID replaces it). On **AWS RDS** there is no `sa`, no true `sysadmin`, and OS-level features are blocked.
 2. **Classify the layer** the request touches and load the matching reference:
    - Authentication / login / Kerberos / Entra ID / orphaned users -> `references/authentication.md`
    - Permissions / roles / schemas / least privilege / impersonation -> `references/authorization-rbac.md`
@@ -68,12 +68,23 @@ The instance runs in one of two **authentication modes** on the box: *Windows Au
 Authentication deep dive — Kerberos vs NTLM selection, SPN registration with `setspn`, MSA/gMSA service accounts, the **double-hop problem** and constrained delegation, the full **Entra ID** variant list, certificate/module-signing logins, contained-DB security considerations, the **18456 login-failure state-code table**, and the `sys.server_principals` type legend — is in `references/authentication.md`.
 
 ```sql
--- Instance authentication mode: 1 = Windows-only, 0 = Mixed Mode
+-- Instance authentication mode: 1 = Windows-only, 0 = Mixed Mode (read-only)
 SELECT SERVERPROPERTY('IsIntegratedSecurityOnly') AS is_windows_auth_only;
+```
 
--- Create a SQL login enforcing Windows password policy (box / MI)
-CREATE LOGIN [app_svc] WITH PASSWORD = N'<strong-secret>',
+```sql
+-- [SECURITY CHANGE] illustrative; use placeholder names, confirm the target instance.
+-- (a) HUMAN / interactive SQL login: enforce policy AND expiration.
+CREATE LOGIN [a_person] WITH PASSWORD = N'<generate-32+char-random-secret>',
     CHECK_POLICY = ON, CHECK_EXPIRATION = ON;
+
+-- (b) SERVICE / application SQL login: enforce policy, but expiration OFF
+--     (the app can't rotate interactively) -> rotate the secret OUT OF BAND on a schedule.
+--     Prefer Windows/Entra/managed identity for services where the platform allows it.
+CREATE LOGIN [app_svc] WITH PASSWORD = N'<generate-32+char-random-secret>',
+    CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;
+-- Source secrets from a secret manager; never commit them; avoid T-SQL/shell history
+-- exposure; rotate any value ever pasted from documentation. See references/authentication.md §2.
 
 -- Create a login from a Windows AD group (membership inherited from AD)
 CREATE LOGIN [CONTOSO\SQL-App-Readers] FROM WINDOWS;
@@ -93,6 +104,7 @@ The chain is **Login (server) -> User (database) -> Schema -> Permission**, appl
 **Least-privilege recipes** (full versions in `references/authorization-rbac.md`):
 
 ```sql
+-- [SECURITY CHANGE] illustrative; confirm DB via DB_NAME(), use placeholder names, run in a scratch DB first.
 -- Read-only application user (prefer schema/DB role over db_datareader if you need scoping)
 CREATE USER [app_ro] FOR LOGIN [app_ro];
 ALTER ROLE [db_datareader] ADD MEMBER [app_ro];
@@ -101,8 +113,10 @@ ALTER ROLE [db_datareader] ADD MEMBER [app_ro];
 CREATE ROLE [sales_rw];
 GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::[Sales] TO [sales_rw];
 DENY ALTER ON SCHEMA::[Sales] TO [sales_rw];  -- block DDL even if granted elsewhere
+```
 
--- Inspect EFFECTIVE permissions of the current principal
+```sql
+-- Inspect EFFECTIVE permissions of the current principal (read-only)
 SELECT * FROM sys.fn_my_permissions(NULL, 'SERVER');
 SELECT * FROM sys.fn_my_permissions('Sales.Orders', 'OBJECT');
 ```
@@ -115,10 +129,10 @@ All keys derive from a hierarchy: **Service Master Key (SMK)** -> **Database Mas
 
 | Feature | Protects against | Encryption point | Queryable? | Perf | Version / platform |
 |---|---|---|---|---|---|
-| **TDE** | Stolen `.mdf`/`.ldf`/backup files (data at rest) | Engine, page I/O | Fully (transparent) | ~3-5% CPU | All editions **2019+** (EE before). Encrypts **tempdb** too. Azure SQL: on by default, service-managed. |
-| **Always Encrypted** | The DBA / cloud operator (data never in plaintext server-side) | **Client driver** | Limited — deterministic allows equality only; randomized none | Client CPU + size growth | **2016+**; **secure enclaves 2019+** enable range/`LIKE`, in-place encryption. CMK in cert store or AKV. |
+| **TDE** | Stolen `.mdf`/`.ldf`/backup files (data at rest) | Engine, page I/O | Fully (transparent) | ~3-5% CPU | Enterprise/Developer historically; Standard/Web/Express **from 2019** (Express has its own backup limits). Encrypts **tempdb** too. Azure SQL: on by default, service-managed. |
+| **Always Encrypted** | The DBA / cloud operator (data never in plaintext server-side) | **Client driver** | Limited — deterministic allows equality only; randomized none | Client CPU + size growth | **2016+**; **secure enclaves 2019+** (VBS enclaves on box, HGS attestation) enable range/`LIKE`, in-place encryption. CMK in Windows cert store or AKV. |
 | **TLS (in transit)** | Network sniffing / MITM | Network channel | N/A | Minimal | All versions. **Strict encryption / TDS 8.0 2022+** (`Encrypt=Strict`). |
-| **Backup encryption** | Stolen backup files | `BACKUP` operation | N/A | Minimal | 2014+ (all editions). Independent of TDE; cert or asymmetric key. |
+| **Backup encryption** | Stolen backup files | `BACKUP` operation | N/A | Minimal | 2014+. Enterprise/Standard can **create** encrypted backups; **Express/Web cannot create** them (any edition can **restore**). Independent of TDE; cert or asymmetric key. |
 | **Cell-level / column** | Targeted column secrecy without app rewrite (server-side keys) | `ENCRYPTBYKEY` / `DECRYPTBYKEY` | Manual, breaks SARGability | Per-call CPU | All versions. Prefer **Always Encrypted** for true client-side secrecy. |
 
 ```sql
@@ -168,7 +182,8 @@ Disable what you do not use; every enabled surface is an attack path. (Details, 
 - [ ] **Database Mail XPs / SQL Mail**: OFF unless mail is in use.
 - [ ] **Ad Hoc Distributed Queries**: OFF.
 - [ ] **`cross db ownership chaining`**: OFF (use module signing instead).
-- [ ] **`remote access` / `remote admin connections`**: OFF unless required.
+- [ ] **`remote access`** (legacy RPC server-to-server): OFF unless a specific legacy feature needs it.
+- [ ] **`remote admin connections`** (remote DAC): keep OFF (0) by default — the local DAC (`sqlcmd -A` from the box console) is always available. Enable (=1) ONLY for a documented break-glass need, e.g. a clustered/AG instance whose active-node console is unreachable; if enabled, restrict the source to DBA jump hosts via host firewall and audit its use. (Infra's conditional `=1` recommendation is for that break-glass case only.)
 - [ ] **Network**: force TLS, non-default port, hide instance / disable SQL Browser, firewall to the SQL port only.
 - [ ] **Service account**: least-privilege (managed/gMSA), with only the rights it needs (Perform Volume Maintenance, Lock Pages in Memory as appropriate).
 - [ ] **`public` / `guest`**: `guest` disabled in user DBs; no extra grants to `public`.
@@ -215,5 +230,5 @@ All scripts are **READ-ONLY**, set `SET NOCOUNT ON;`, and guard version-specific
 - **`sqlserver-cloud`** — Entra ID setup specifics, Azure Key Vault, vulnerability assessment, Microsoft Defender for SQL, Private Link, RDS/MI security constraints.
 - **`sqlserver-operations`** — patching/CU cadence, backup encryption operations, restoring TDE-protected databases.
 - **`sqlserver-ha-clustering`** — endpoint (certificate) authentication for AGs/mirroring, login/user sync across replicas, TDE on AG members.
-- **`sqlserver-monitoring`** — Extended Events for security tracing, auditing read patterns, alerting on suspicious activity.
+- **`sqlserver-monitoring`** — Extended Events for security tracing, auditing read patterns, alerting on suspicious activity; community diagnostic tools (Brent Ozar First Responder Kit `sp_Blitz` surfaces many security/config findings) are documented there.
 - **`sqlserver-engineering`** — query impact of RLS predicates, Always Encrypted parameterization, indexing of encrypted/masked columns.

@@ -9,6 +9,13 @@
  *           EngineEdition 2 (Standard), 3 (Enterprise/Developer), 4 (Express).
  *           NOT for Azure SQL Database (5) or Managed Instance (8).
  * Safety  : Read-only. No modifications to data or configuration.
+ * Scope   : FULLY meaningful on SQL-on-Azure-VM and EC2 (you own the host).
+ *           On AWS RDS / GCP Cloud SQL the HOST-LEVEL parts are restricted or
+ *           meaningless (you do not own the OS / VM sizing / service account):
+ *           Section 1 socket/VM fields, Section 2 (sys.dm_server_services),
+ *           and Section 5 (max server memory is platform-managed). Those parts
+ *           are guarded with TRY/CATCH or notes so the script still runs; the
+ *           managed providers configure them for you.
  *
  * Sections:
  *   0. Platform guard (must be a box engine: EngineEdition 2/3/4)
@@ -43,6 +50,10 @@ END;
 
 /*──────────────────────────────────────────────────────────────────────────────
   Section 1: Platform / Edition / Cloud-host hints
+  Note: socket_count / cores_per_socket / virtual_machine_type_desc reflect the
+  HOST/VM. They are accurate on SQL-on-Azure-VM / EC2 (you sized the VM); on
+  AWS RDS / GCP Cloud SQL the provider sizes the host, so treat these as
+  informational only - you cannot act on VM sizing there.
 ──────────────────────────────────────────────────────────────────────────────*/
 SELECT
     SERVERPROPERTY('ServerName')                           AS server_name,
@@ -64,13 +75,24 @@ FROM sys.dm_os_sys_info AS si;
   Section 2: Instant File Initialization (IFI) status
   IFI ("Perform volume maintenance tasks") avoids zero-filling data files on
   growth/restore - important on cloud disks where growth events are common.
-  Note: AWS RDS manages this for you and may not expose the setting.
+  Note: sys.dm_server_services exposes host-level service info and is RESTRICTED
+  on AWS RDS / GCP Cloud SQL (no host access) - the managed provider sets IFI
+  for you. It is fully meaningful only on SQL-on-Azure-VM / EC2. Guarded so the
+  script keeps running where the DMV is unavailable.
 ──────────────────────────────────────────────────────────────────────────────*/
-SELECT
-    instant_file_initialization_enabled,                   -- 'Y' / 'N' (2016 SP1+)
-    service_account
-FROM sys.dm_server_services
-WHERE servicename LIKE N'SQL Server (%';
+BEGIN TRY
+    SELECT
+        instant_file_initialization_enabled,              -- 'Y' / 'N' (2016 SP1+)
+        service_account
+    FROM sys.dm_server_services
+    WHERE servicename LIKE N'SQL Server (%';
+END TRY
+BEGIN CATCH
+    SELECT 'sys.dm_server_services unavailable here (restricted on RDS/Cloud SQL '
+         + 'or insufficient permission). On a managed box the provider configures '
+         + 'IFI and the service account for you. Fully meaningful on SQL-on-VM/EC2.'
+         AS info_message;
+END CATCH;
 
 /*──────────────────────────────────────────────────────────────────────────────
   Section 3: Data & Log File Latency vs cloud-disk expectations
@@ -140,6 +162,10 @@ FROM (
 /*──────────────────────────────────────────────────────────────────────────────
   Section 5: max server memory vs physical RAM (VM-size sanity)
   On a cloud VM you pay for RAM - leave headroom for the OS but don't strand it.
+  PLATFORM NOTE: actionable only on SQL-on-Azure-VM / EC2, where YOU set
+  'max server memory'. On AWS RDS this is governed by the parameter group
+  (often via the {DBInstanceClassMemory} formula); on GCP Cloud SQL it is
+  platform-managed. Read the verdict as informational on those managed boxes.
 ──────────────────────────────────────────────────────────────────────────────*/
 SELECT
     c.name                                                 AS config_name,

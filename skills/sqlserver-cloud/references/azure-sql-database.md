@@ -4,6 +4,8 @@ Azure SQL Database is **database-as-a-service**, not an instance. The unit you p
 
 This is the offering people most often misuse by assuming it behaves like the box product. It does not. Read the gaps section before prescribing anything.
 
+> **Related on the same engine.** **Microsoft Fabric SQL Database** is a GA OLTP database built on the *same* Azure SQL Database engine (but it reports its own `EngineEdition = 12` per current Microsoft Learn — verify for your build), surfaced inside Microsoft Fabric with data auto-replicated to OneLake — reach for it when the workload lives in a Fabric/analytics estate. For dev/test and proof-of-concept, the **Azure SQL Database free offer** gives a serverless General Purpose database with a monthly free allowance (currently ~100,000 vCore-seconds + 32 GB data, no SLA; verify current allowances on Microsoft Learn) that auto-pauses when the quota is hit.
+
 ---
 
 ## 1. Purchasing Models & Service Tiers
@@ -19,6 +21,8 @@ A **Database Transaction Unit** is an opaque blended measure of CPU + memory + I
 | **Standard** | 10–3000 DTU (S0–S12) | up to 1 TB | General-purpose production |
 | **Premium** | 125–4000 DTU (P1–P15) | up to 4 TB | IO-intensive, low-latency, local SSD, higher availability |
 
+The listed **max size is attainable only at the higher service objectives** within a tier (e.g. the small S0/S1 or P1 levels cap well below the tier maximum). Confirm the size ceiling for your specific objective on Microsoft Learn.
+
 DTU is hard to right-size because you cannot see which resource is the bottleneck. Migrate to vCore when in doubt.
 
 ### vCore model (recommended)
@@ -28,7 +32,9 @@ Decouples **compute** (vCores + memory), **storage**, and **IO**, and exposes ha
 |---|---|---|---|---|
 | **General Purpose (GP)** | Remote premium storage (compute and storage separated) | Local redundancy; optional zone redundancy | 4 TB | Most production workloads; budget-balanced |
 | **Business Critical (BC)** | Local SSD, built-in Always On AG (3–4 replicas) | Highest; built-in read-scale replica; zone-redundant option | 4 TB | Low-latency IO, high availability, in-memory OLTP, free readable secondary |
-| **Hyperscale** | Distributed: page servers + log service + RBPEX cache | HA replicas + named replicas; zone-redundant option | **100 TB** | Very large DBs, fast restore, read scale-out, rapid scale up/down |
+| **Hyperscale** | Distributed: page servers + log service + RBPEX cache | HA replicas + named replicas; zone-redundant option | **128 TB*** | Very large DBs, fast restore, read scale-out, rapid scale up/down |
+
+\* 128 TB for a single Hyperscale database; databases in a **Hyperscale elastic pool** currently cap lower (100 TB). Cloud limits change quarterly — **verify the current value on Microsoft Learn** for your configuration.
 
 **DTU↔vCore rough mapping:** ~100 DTU Standard ≈ 1 GP vCore; Premium DTUs map toward Business Critical. Treat this as a starting point only; validate with `sys.dm_db_resource_stats`.
 
@@ -64,7 +70,7 @@ Hyperscale is a re-architected storage engine, not just a bigger tier. Compute i
 - **Azure storage** — long-term backup of data files and log, enabling **near-instant backups** (snapshot-based, no size-of-data copy) and **fast restore** (constant-time regardless of DB size).
 
 Capabilities:
-- Up to **100 TB**; grow without pre-provisioning storage.
+- Up to **128 TB** (single database; verify the current GA limit on Microsoft Learn — cloud limits change quarterly); grow without pre-provisioning storage.
 - **Rapid scale** of compute up/down in minutes (it's a metadata/cache operation, not a data copy).
 - **Read scale-out** via **HA replicas** (for availability + reads) and **named replicas** (independent endpoints/SLOs for read-only workloads, e.g. reporting, isolated from the primary's compute).
 - Zone-redundant configuration available.
@@ -157,6 +163,13 @@ Azure SQL Database **has no SQL Server Agent**. The replacement is **Elastic Job
   - **Redirect** (default within Azure): client is redirected straight to the node hosting the DB (lower latency, fewer hops) — requires outbound ports 11000–11999 open.
   - **Proxy**: all traffic goes through the gateway on 1433 (higher latency, simpler firewalling) — used for connections from outside Azure or when only 1433 is allowed.
 - **Firewall**: server-level and database-level firewall rules; **Private Link / private endpoints** for fully private access; "Allow Azure services" toggle for intra-Azure reach.
+
+### Connection resiliency & transient faults
+PaaS connections are **expected to drop** periodically — scale operations (changing tier/vCores), planned failovers, and platform maintenance briefly reconfigure the back end and sever open connections. This is normal, not an outage. Design for it:
+- **Enable retry-with-backoff** on every connection and command. Don't retry blindly — use exponential backoff with jitter and a cap, and only retry **transient** error numbers (e.g. 40197, 40501, 40613, 49918, 4060, 10928/10929) plus connection-level timeouts.
+- **Make operations idempotent** so a retried command can't double-apply (wrap multi-statement work in a transaction, or use idempotent upserts/keys) — a connection can drop *after* the server committed but *before* the client got the ack.
+- **Use the built-in retry provider** in **Microsoft.Data.SqlClient** (the recommended driver): configurable retry logic via `SqlConfigurableRetryFactory` / connection-string `ConnectRetryCount`/`ConnectRetryInterval`, instead of hand-rolling. EF Core's `EnableRetryOnFailure` (`SqlServerRetryingExecutionStrategy`) is the EF equivalent.
+- **Configure a maintenance window** on the database (e.g. a chosen off-hours slot) so planned maintenance reconfigurations land predictably rather than at random.
 
 ---
 

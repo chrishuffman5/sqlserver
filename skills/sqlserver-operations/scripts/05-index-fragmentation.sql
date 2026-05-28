@@ -78,8 +78,9 @@ FROM frag;
   -- Reorganize (online, minimally logged, interruptible):
   -- ALTER INDEX [<index>] ON [<schema>].[<table>] REORGANIZE;
 
-  -- Rebuild (offline). On Enterprise / 2019+/2022+ add ONLINE = ON.
-  -- Add RESUMABLE = ON (2017+) for large indexes in short windows:
+  -- Rebuild (offline). On Enterprise/Developer/Evaluation (or Azure SQL) add ONLINE = ON;
+  -- ONLINE index rebuild is NOT available on Standard on ANY box version (gated by edition, not version).
+  -- Add RESUMABLE = ON (2017+) for large indexes in short windows (RESUMABLE requires ONLINE = ON, so Enterprise-gated on box):
   -- ALTER INDEX [<index>] ON [<schema>].[<table>]
   --   REBUILD WITH (ONLINE = ON, RESUMABLE = ON, FILLFACTOR = 90, MAX_DURATION = 60 MINUTES);
 

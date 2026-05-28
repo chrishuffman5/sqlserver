@@ -9,6 +9,12 @@
  *           some server-level objects are unavailable; per-DB sections still run.
  * Safety  : READ-ONLY. No data, login, permission, or configuration changes.
  *           All remediation is shown ONLY as commented-out templates.
+ * Note    : Per-database sections use sys.sp_MSforeachdb, which is UNDOCUMENTED
+ *           and unsupported, can SILENTLY SKIP databases (known to miss DBs
+ *           under load / with certain states), and is UNAVAILABLE on Azure SQL
+ *           Database. For production estates, prefer a supported explicit cursor
+ *           over sys.databases (filtering state_desc = 'ONLINE' and, if needed,
+ *           HAS_DBACCESS(name) = 1) to guarantee every database is covered.
  *
  * Sections:
  *   1. Authentication Mode

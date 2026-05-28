@@ -8,7 +8,11 @@ Availability: SQL Server 2016+ (box, all editions). **Default ON in Azure SQL Da
 
 ## Enabling & Configuring
 
+Enabling or reconfiguring Query Store is a `[CONFIG CHANGE]` (`ALTER DATABASE ... SET QUERY_STORE`). It is low-risk and reversible (`SET QUERY_STORE = OFF`), but confirm the target via `DB_NAME()` first and use a placeholder DB name like `[MyDB]`.
+
 ```sql
+-- [CONFIG CHANGE] enables/reconfigures Query Store on the named DB. Confirm DB_NAME() first.
+-- Reversible: ALTER DATABASE [MyDB] SET QUERY_STORE = OFF;
 ALTER DATABASE [MyDB] SET QUERY_STORE = ON
 (
     OPERATION_MODE          = READ_WRITE,    -- READ_WRITE (collecting) | READ_ONLY (full/over budget) | OFF
@@ -39,6 +43,7 @@ ALTER DATABASE [MyDB] SET QUERY_STORE = ON
 `QUERY_CAPTURE_MODE = CUSTOM` adds a policy that only captures queries crossing thresholds within a window — dramatically reduces noise on high-ad-hoc workloads.
 
 ```sql
+-- [CONFIG CHANGE] Confirm DB_NAME() first; use a placeholder DB name. Reversible via SET QUERY_STORE = OFF.
 ALTER DATABASE [MyDB] SET QUERY_STORE = ON
 (
     OPERATION_MODE     = READ_WRITE,
@@ -71,7 +76,7 @@ SELECT
 FROM sys.database_query_store_options;
 ```
 
-Common `readonly_reason` causes: storage cap reached (size-based cleanup off or undersized), database read-only/in single-user, or QS internal error. Increase `MAX_STORAGE_SIZE_MB` and/or enable `SIZE_BASED_CLEANUP_MODE = AUTO`, then `SET QUERY_STORE CLEAR;` only if you intend to discard history.
+Common `readonly_reason` causes: storage cap reached (size-based cleanup off or undersized), database read-only/in single-user, or QS internal error. Fix it **non-destructively first**: raise `MAX_STORAGE_SIZE_MB` and enable `SIZE_BASED_CLEANUP_MODE = AUTO` (both `[CONFIG CHANGE]`, see the change templates below) so QS resumes `READ_WRITE` without losing history. `SET QUERY_STORE CLEAR` is a **last resort only** — it destroys the very history you are trying to diagnose; see the Change Templates section before considering it.
 
 ---
 
@@ -178,15 +183,9 @@ When a regression is real and a known-good `plan_id` exists in history, force it
 
 Forcing pins a specific plan so the optimizer reuses it regardless of sniffed parameters. It is the fastest mitigation for a plan-flip regression while you work on a real fix (better index, statistics, or query change in `sqlserver-engineering`).
 
-```sql
--- Force plan 7 for query 42
-EXEC sp_query_store_force_plan @query_id = 42, @plan_id = 7;
+Forcing/unforcing is a `[PERFORMANCE CHANGE]` — it alters how queries plan in production. The actual `sp_query_store_force_plan` / `sp_query_store_unforce_plan` calls are gathered (commented, with the pre-flight) in **[Change Templates](#change-templates-mutating--review-before-running)** below; run them only after confirming the exact `query_id`/`plan_id` from the regression query.
 
--- Release the forced plan
-EXEC sp_query_store_unforce_plan @query_id = 42, @plan_id = 7;
-```
-
-Verify and audit forced plans:
+The read-only side — **verify and audit forced plans** — stays here:
 
 ```sql
 SELECT
@@ -210,23 +209,12 @@ A non-zero `force_failure_count` means the forced plan is no longer valid (e.g. 
 
 Query Store hints let you attach query hints to a `query_id` **without changing application code** — they survive recompiles and apply wherever that query runs. Ideal when you cannot edit the query (third-party app, ORM-generated SQL).
 
+Applying/clearing a hint is a `[PERFORMANCE CHANGE]`; the `sp_query_store_set_hints` / `sp_query_store_clear_hints` calls live (commented, with pre-flight) in **[Change Templates](#change-templates-mutating--review-before-running)** below. The hint-inspection query is read-only and stays here:
+
 ```sql
--- Apply hints to query 42 (e.g. tame a bad parallel plan / force recompile)
-EXEC sp_query_store_set_hints
-     @query_id    = 42,
-     @query_hints = N'OPTION (MAXDOP 1, RECOMPILE)';
-
--- Other examples:
---   N'OPTION (OPTIMIZE FOR (@p = 100))'
---   N'OPTION (USE HINT(''DISABLE_PARAMETER_SNIFFING''))'
---   N'OPTION (HASH JOIN)'
-
--- Inspect existing hints
+-- Inspect existing hints (read-only). Capture this BEFORE changing anything (rollback baseline).
 SELECT query_hint_id, query_id, query_hint_text, source_desc, last_query_hint_failure_reason_desc
 FROM sys.query_store_query_hints;
-
--- Remove the hint
-EXEC sp_query_store_clear_hints @query_id = 42;
 ```
 
 Hints are lower-friction than plan forcing for many problems (you express *intent* rather than pinning a brittle plan). Available SQL Server 2022+ and Azure SQL DB/MI.
@@ -238,10 +226,10 @@ Hints are lower-friction than plan forcing for many problems (you express *inten
 SQL Server 2022 can capture Query Store data for read workloads running on **Always On readable secondary replicas**, so you can diagnose report queries that only ever run on the secondary. It is controlled by a database-scoped configuration, set on the primary:
 
 ```sql
--- Run on the primary; replicates to secondaries
+-- [CONFIG CHANGE] Run on the primary (confirm DB_NAME()); replicates to secondaries. Reversible: SET ... = OFF.
 ALTER DATABASE SCOPED CONFIGURATION SET QUERY_STORE_FOR_SECONDARY = ON;
 
--- Verify
+-- Verify (read-only)
 SELECT name, value
 FROM sys.database_scoped_configurations
 WHERE name = 'QUERY_STORE_FOR_SECONDARY';
@@ -253,7 +241,12 @@ Secondary-captured data is reconciled back to the primary's Query Store. AG/repl
 
 ## Cloud Default-On (Azure SQL DB / MI)
 
-Query Store is **on by default** in Azure SQL Database and Azure SQL Managed Instance, and it powers **Query Performance Insight** and automatic plan-correction. Microsoft tunes default options for the service tier, but you can still `ALTER DATABASE ... SET QUERY_STORE` to adjust storage/intervals. **Automatic plan correction** (`ALTER DATABASE ... SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`) builds on QS regression detection to auto-force the last good plan — available in Azure by default and in box 2017+. Deep cloud telemetry is in `sqlserver-cloud`.
+Query Store is **on by default** in Azure SQL Database and Azure SQL Managed Instance, and it powers **Query Performance Insight** and automatic plan-correction. Microsoft tunes default options for the service tier, but you can still `ALTER DATABASE ... SET QUERY_STORE` to adjust storage/intervals (a `[CONFIG CHANGE]`). **Automatic plan correction** (`FORCE_LAST_GOOD_PLAN`) builds on QS regression detection to auto-force the last good plan when a regression is detected (and auto-unforce if it doesn't help):
+
+- **Azure SQL Database / Managed Instance:** `FORCE_LAST_GOOD_PLAN` is **ON by default** (it is part of the inherited Azure automatic-tuning defaults).
+- **Box SQL Server (2017+):** it is **opt-in** — you must enable it explicitly per database: `[CONFIG CHANGE]` `ALTER DATABASE [MyDB] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON);` (reversible with `= OFF`; confirm `DB_NAME()` first).
+
+Deep cloud telemetry is in `sqlserver-cloud`.
 
 ---
 
@@ -263,20 +256,9 @@ Query Store is **on by default** in Azure SQL Database and Azure SQL Managed Ins
 - **Keep `SIZE_BASED_CLEANUP_MODE = AUTO`** so QS purges oldest data near the cap instead of wedging.
 - **`STALE_QUERY_THRESHOLD_DAYS`** sets time-based retention; pair with size-based cleanup.
 - **Use `QUERY_CAPTURE_MODE = AUTO` (or `CUSTOM` on 2019+)** on high-ad-hoc systems to avoid filling the store with one-shot queries.
-- Manual maintenance procedures (use deliberately, they discard data):
+- Manual purge/reset procedures **discard diagnostic history** — they are gathered (commented, with pre-flight) in **[Change Templates](#change-templates-mutating--review-before-running)** below. Always prefer right-sizing + size-based cleanup over manual purges.
 
-```sql
--- Purge a single query's data
-EXEC sp_query_store_remove_query @query_id = 42;
--- Purge a single plan
-EXEC sp_query_store_remove_plan  @plan_id  = 7;
--- Reset runtime stats only (keeps queries/plans)
-EXEC sp_query_store_reset_exec_stats @query_id = 42;
--- Clear the entire store (DESTRUCTIVE — discards all QS history)
--- ALTER DATABASE [MyDB] SET QUERY_STORE CLEAR;
-```
-
-Storage health quick check:
+Storage health quick check (read-only):
 
 ```sql
 SELECT
@@ -286,4 +268,58 @@ SELECT
          / NULLIF(max_storage_size_mb,0) AS DECIMAL(5,2)) AS pct_full,
     actual_state_desc, readonly_reason
 FROM sys.database_query_store_options;
+```
+
+---
+
+## 2022 Query-Intelligence Telemetry in Query Store
+
+SQL Server 2022 (16.x) surfaces several **Intelligent Query Processing (IQP)** feedback features through Query Store, so an engine-driven adaptive change leaves a visible audit trail. This matters during triage: a plan or hint that changed because the *engine* applied feedback is **not** a regression to chase — it is the engine self-correcting.
+
+- **`sys.query_store_plan_feedback` (read-only catalog view)** records query-feedback activity: **CE feedback** (cardinality-estimation model assumptions), **DOP feedback** (degree-of-parallelism tuning), **memory-grant feedback** (persisted grant sizing), and **LAQ** (lock-after-qualification). Each row ties a `plan_id` to a feedback `feature_desc` and a state (e.g. verification in progress vs. persisted). Persistence for CE/DOP/memory-grant feedback is **on by default in 2022**, but only takes effect when Query Store is enabled and `READ_WRITE`. *(Verify the exact column names — `feature_desc`, `feedback_data`, `state_desc` — on Microsoft Learn for your build.)*
+- **CE and DOP feedback are implemented as Query Store hints**, so they also appear in `sys.query_store_query_hints` with `source_desc` indicating the engine (e.g. CE feedback) rather than a user. **Memory-grant feedback** persists in `sys.query_store_plan_feedback`. In a plan's XML, a hint sourced from feedback shows `QueryStoreStatementHintSource = 'CE feedback'` (and equivalents).
+- **PSP (Parameter-Sensitive Plan) optimization (2022+)** lets a single parameterized query keep **multiple plan variants** behind a *dispatcher* plan, choosing a variant by predicate cardinality at runtime. In Query Store you will see several `plan_id`s for the same `query_id` that are all legitimate — do not "fix" this by force-pinning one variant unless you have confirmed a specific variant regressed.
+
+**Telling engine feedback from a real regression:** before forcing a plan, check whether the change was engine-driven. If `sys.query_store_query_hints.source_desc` shows a feedback source, or the new `plan_id` is a PSP variant, the engine is adapting — give it a few executions to stabilize and watch the regression query, rather than immediately forcing. Force a plan only when a *user* workload genuinely regressed and the engine is not converging.
+
+---
+
+## Change Templates (mutating — review before running)
+
+The procedures below **change production behavior or discard diagnostic history**. They are presented as **commented templates**, not runnable script. Run them only deliberately, after the pre-flight, with the exact IDs confirmed from the read-only queries above.
+
+**Pre-flight (every template here):**
+
+1. **Capture current state first** (rollback baseline): forced-plan inventory — `SELECT query_id, plan_id FROM sys.query_store_plan WHERE is_forced_plan = 1;` — and existing hints — `SELECT * FROM sys.query_store_query_hints;`. Save the output.
+2. **Confirm the exact `query_id` / `plan_id`** from the **Regressed Queries** query above (do not reuse the example `42` / `7`).
+3. **Confirm the correct database** (`SELECT DB_NAME();`) and pick a **low-risk workload window**.
+4. **Define rollback** before you act: unforce the plan, `sp_query_store_clear_hints`, or re-force the last known-good plan.
+5. **Monitor afterward**: watch `force_failure_count` / `last_force_failure_reason_desc` (forced plans) and `last_query_hint_failure_reason_desc` (hints); confirm the target query's runtime improved in the next intervals.
+
+```sql
+-- [PERFORMANCE CHANGE] Force / unforce a plan. Confirm query_id & plan_id from the regression query first.
+-- EXEC sp_query_store_force_plan   @query_id = [CONFIRM_QUERY_ID], @plan_id = [CONFIRM_PLAN_ID];
+-- Rollback (release the forced plan):
+-- EXEC sp_query_store_unforce_plan @query_id = [CONFIRM_QUERY_ID], @plan_id = [CONFIRM_PLAN_ID];
+
+-- [PERFORMANCE CHANGE] Apply / clear a Query Store hint (2022+). Capture existing hints first (rollback baseline).
+-- EXEC sp_query_store_set_hints
+--      @query_id    = [CONFIRM_QUERY_ID],
+--      @query_hints = N'OPTION (MAXDOP 1, RECOMPILE)';
+--   Other shapes: N'OPTION (OPTIMIZE FOR (@p = 100))'
+--                 N'OPTION (USE HINT(''DISABLE_PARAMETER_SNIFFING''))'
+--                 N'OPTION (HASH JOIN)'
+-- Rollback (remove the hint):
+-- EXEC sp_query_store_clear_hints @query_id = [CONFIRM_QUERY_ID];
+
+-- [DATA-LOSS RISK] The following DISCARD Query Store diagnostic history and cannot be undone.
+-- Prefer right-sizing MAX_STORAGE_SIZE_MB + SIZE_BASED_CLEANUP_MODE = AUTO over manual purges.
+-- Purge a single query's data:
+-- EXEC sp_query_store_remove_query     @query_id = [CONFIRM_QUERY_ID];
+-- Purge a single plan:
+-- EXEC sp_query_store_remove_plan      @plan_id  = [CONFIRM_PLAN_ID];
+-- Reset runtime stats only (keeps queries/plans, drops their history):
+-- EXEC sp_query_store_reset_exec_stats @query_id = [CONFIRM_QUERY_ID];
+-- Clear the ENTIRE store (erases ALL QS history for the database) — last resort only:
+-- ALTER DATABASE [CONFIRM_DB] SET QUERY_STORE CLEAR;
 ```

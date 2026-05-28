@@ -17,8 +17,8 @@ Every enabled feature is a potential attack path. Disable what you don't use. In
 | **`Database Mail XPs`** | 0 | Outbound mail subsystem | OFF unless DB Mail is used. |
 | **`Ad Hoc Distributed Queries`** | 0 | `OPENROWSET`/`OPENDATASOURCE` reach external sources ad hoc | OFF. Use defined linked servers if needed. |
 | **`cross db ownership chaining`** | 0 | Lets ownership chains cross databases -> cross-DB escalation | OFF (use module signing). |
-| **`remote access`** | 1 (legacy) | Legacy RPC to/from remote servers | OFF unless required. |
-| **`remote admin connections`** | 0 | DAC over the network | OFF unless you need remote DAC; if on, restrict by firewall. |
+| **`remote access`** | 1 (legacy) | Legacy server-to-server RPC (`sp_addserver`-era heterogeneous queries) — distinct from remote DAC | OFF unless a specific legacy feature needs it. |
+| **`remote admin connections`** (remote DAC) | 0 | Dedicated Admin Connection over the **network** | Keep **OFF (0)** by default — the **local DAC** (`sqlcmd -A` from the box console) is always available. Enable (=1) ONLY for a documented **break-glass** need, e.g. a clustered/AG instance whose active-node console is unreachable. If enabled, restrict the source to **DBA jump hosts via host firewall** and **audit** its use. (`sqlserver-infrastructure`'s conditional `=1` recommendation is for that break-glass case only — the wording is harmonized across both skills.) |
 | **`scan for startup procs`** | 0 | Allows auto-run procs at startup | Audit which procs are flagged (below). |
 
 ```sql
@@ -186,7 +186,7 @@ A condensed, high-value subset of the CIS Microsoft SQL Server Benchmark:
 - [ ] `cross db ownership chaining` = 0.
 - [ ] `Database Mail XPs` = 0 (if mail unused).
 - [ ] `Ole Automation Procedures` = 0.
-- [ ] `remote access` = 0; `remote admin connections` = 0 (unless needed).
+- [ ] `remote access` = 0 (legacy server-to-server RPC); `remote admin connections` (remote DAC) = 0 by default — enable only for a documented break-glass case, then firewall-restrict to DBA jump hosts and audit.
 - [ ] `scan for startup procs` = 0 (and startup procs audited).
 - [ ] `xp_cmdshell` = 0.
 - [ ] `sa` disabled and/or renamed; no blank/weak SQL-login passwords.
@@ -203,11 +203,13 @@ A condensed, high-value subset of the CIS Microsoft SQL Server Benchmark:
 
 ---
 
-## 9. Cloud: Vulnerability Assessment & Defender for SQL
+## 9. Vulnerability Assessment & Defender for SQL (box *and* cloud)
 
-For **Azure SQL DB/MI** (and Arc-enabled box):
-- **SQL Vulnerability Assessment (VA)** scans against a built-in rule baseline (many CIS-aligned) and tracks drift — the cloud equivalent of running these hardening checks.
-- **Microsoft Defender for SQL** adds threat detection (SQL injection, anomalous access, brute force) and surfaces VA findings.
+- **SQL Vulnerability Assessment (VA)** scans against a built-in rule baseline (many CIS-aligned) and tracks drift. **VA is not cloud-only:** it runs **from SSMS against box instances** (right-click a database → Tasks → Vulnerability Assessment) as well as against **Azure SQL DB/MI** — so on-prem DBAs can use it as a built-in alternative to the manual hardening checks here.
+- **Microsoft Defender for SQL** adds threat detection (SQL injection, anomalous access, brute force) and surfaces VA findings. It covers **Azure SQL DB/MI** *and* **SQL Server on-premises/other clouds via Azure Arc** (Arc-enabled SQL Server), extending threat protection to box estates.
+- **Audit-to-SIEM / immutable storage:** forward SQL Server Audit and login events to a central **SIEM** (e.g. via the Windows Security log → agent, file-target ingestion, or — in Azure — diagnostic settings to Log Analytics/Event Hub). Store the audit trail on **append-only / immutable storage** (WORM, or Azure Blob with an immutability policy) so a compromised DBA cannot rewrite history — the same principle as ledger digest auto-storage (`data-protection.md`).
 - Combine with **Entra-only authentication**, **Private Link**, and **AKV-managed keys**.
+
+> **Verify 2025 security additions on Microsoft Learn.** SQL Server 2025 adds/changes security surface (e.g. evolving Entra integration on box, JSON/vector and other new surfaces, and updated defaults). Confirm the exact feature set and edition gates for your build on Microsoft Learn before relying on a 2025-specific control.
 
 Setup and Azure-side specifics live in **`sqlserver-cloud`**. Patching cadence lives in **`sqlserver-operations`**. OS-level network/account configuration lives in **`sqlserver-infrastructure`**.

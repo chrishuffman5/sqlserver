@@ -230,11 +230,17 @@ EXEC sys.sp_executesql @sql,
      @CustomerID = @cust, @Since = @since;
 ```
 
-- Only **values** can be parameters. For dynamic **identifiers** (table/column names), you cannot parameterize — validate against a whitelist / `sys.objects` and wrap with `QUOTENAME()`:
+- Only **values** can be parameters. For dynamic **identifiers** (table/column names), you cannot parameterize — the **primary defense is whitelisting**: validate the requested name against the catalog (`sys.objects` / `sys.schemas` / `sys.columns`) so only a real, permitted object can be used; then wrap with `QUOTENAME()` as defense-in-depth:
   ```sql
+  -- Whitelist FIRST: reject anything that isn't a real object the caller is allowed to touch
+  IF NOT EXISTS (SELECT 1 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
+                 WHERE s.name = @schema AND o.name = @table AND o.type = 'U')
+      THROW 50000, N'Unknown or disallowed table.', 1;
+
   SET @sql = N'SELECT * FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' WHERE ...';
   ```
-- Never build predicates by string-concatenating user input. `QUOTENAME` defends identifiers; `sp_executesql` parameters defend values.
+- **`QUOTENAME()` gotcha:** its input is `sysname` (`nvarchar(128)`), so an identifier **longer than 128 characters returns `NULL`** — silently collapsing your whole dynamic string to `NULL` (and, if an attacker supplies a 129+ char string, bypassing the bracket-escaping you relied on). Whitelisting against the catalog closes that hole, because real object names are ≤ 128 chars.
+- Never build predicates by string-concatenating user input. **Whitelisting** is the real defense for identifiers; `QUOTENAME` is a wrapper, not a guarantee; `sp_executesql` parameters defend values.
 
 ---
 

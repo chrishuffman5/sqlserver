@@ -20,8 +20,11 @@ The AG is created with `WITH (CLUSTER_TYPE = …)` in 2017+. On 2016 (Windows on
 
 ### Replicas and roles
 
-- Up to **9 replicas** total: **1 primary + up to 8 secondaries**.
-- Up to **3 synchronous-commit** replicas may participate in automatic failover at once (one primary + two sync secondaries with automatic failover, historically; the engine supports up to 3 sync replicas).
+- Up to **9 replicas** total: **1 primary + up to 8 secondaries** (2016+).
+- Three caps are distinct — don't conflate them:
+  - **Synchronous-commit replicas**: up to **3** on SQL Server 2016/2017 (1 primary + 2 sync secondaries); raised to **5** (1 primary + 4 sync secondaries) on **2019+**. Verify the exact cap for your build on Microsoft Learn.
+  - **Automatic-failover targets**: up to **3** on 2016+ (1 primary + 2 sync secondaries with `FAILOVER_MODE = AUTOMATIC`); was **2** in SQL Server 2012/2014. On 2019+ the full 5-replica sync group can be configured for automatic failover within the group.
+  - **Total secondaries**: up to **8** regardless of commit mode (the rest run async).
 - Each replica is a **standalone instance or an FCI**, each with its **own copy** of the availability databases (non-shared storage). An FCI replica cannot be an *automatic* failover target for the AG.
 - Roles: **PRIMARY** (read-write, ships log) and **SECONDARY** (applies redo, optionally readable).
 
@@ -78,7 +81,9 @@ A group-level setting that says "a commit may only complete if at least *N* sync
 - Database/log file **paths must exist** (matching layout) on the secondary, or use `db_file_path` mapping (Linux/cross-platform).
 - The AG must have `GRANT CREATE ANY DATABASE` to the AG on the secondary:
   ```sql
-  ALTER AVAILABILITY GROUP [ag] GRANT CREATE ANY DATABASE;   -- run on each secondary
+  -- [SECURITY CHANGE] Grants the AG the right to create databases on this secondary (needed for automatic seeding).
+  -- Setup step; run deliberately on each secondary. Confirm you are on the intended secondary instance.
+  ALTER AVAILABILITY GROUP [MyAG] GRANT CREATE ANY DATABASE;   -- run on each secondary
   ```
 - Watch progress with `sys.dm_hadr_automatic_seeding` and `sys.dm_hadr_physical_seeding_stats` (see `scripts/01-ag-health.sql`).
 - Automatic seeding streams uncompressed by default; enable backup compression / trace flag 9567 to compress the seeding stream over slow links (test the CPU cost).
@@ -98,20 +103,35 @@ primary_role  (ALLOW_CONNECTIONS = { READ_WRITE | ALL })
 ### Read-only routing
 
 ```sql
-ALTER AVAILABILITY GROUP [ag]
+-- [CONFIG CHANGE] Read-only routing config. Setup step; run deliberately. Confirm the AG/replica names.
+ALTER AVAILABILITY GROUP [MyAG]
 MODIFY REPLICA ON N'NODE2'
 WITH (PRIMARY_ROLE (READ_ONLY_ROUTING_LIST = (('NODE2','NODE3'), 'NODE4')));  -- load-balanced sub-list, then fallback
-ALTER AVAILABILITY GROUP [ag]
+ALTER AVAILABILITY GROUP [MyAG]
 MODIFY REPLICA ON N'NODE2'
 WITH (SECONDARY_ROLE (READ_ONLY_ROUTING_URL = N'TCP://NODE2.contoso.com:1433'));
 ```
 Clients connect to the **listener** with `ApplicationIntent=ReadOnly`; the primary redirects them per the routing list. Load-balancing across a sub-list (the inner parenthesized group) is 2016+.
 
+### Read/write connection redirection (`READ_WRITE_ROUTING_URL`, 2019+)
+
+When there is **no clustered listener** (`CLUSTER_TYPE = NONE` for read-scale/DR, or `EXTERNAL`/Pacemaker multi-subnet where a listener is awkward), clients still need a way to reach the **primary** for read-write work. SQL Server **2019 (15.x)+** adds **read/write connection redirection**: a secondary set with `READ_WRITE_ROUTING_URL` redirects an incoming `ApplicationIntent=ReadWrite` connection to the current primary, regardless of which replica the connection string named. (Verify build support on Microsoft Learn; the feature is platform-agnostic.)
+
+```sql
+-- [CONFIG CHANGE] Per-replica routing for listener-less AGs (2019+). Setup; run deliberately.
+-- Each replica needs SECONDARY_ROLE(ALLOW_CONNECTIONS = ALL) for r/w redirect to engage.
+ALTER AVAILABILITY GROUP [MyAG]
+MODIFY REPLICA ON N'NODE1'
+WITH (PRIMARY_ROLE (READ_WRITE_ROUTING_URL = N'TCP://NODE1.contoso.com:1433'));
+-- Repeat for every replica with its own URL; ALLOW_CONNECTIONS = ALL on the secondary role.
+```
+Without redirection (or a listener), a client pointed at a former primary after a manual failover cannot transparently follow the role — set `READ_WRITE_ROUTING_URL` on every replica for listener-less topologies. Starting with 2025 you can set `READ_WRITE_ROUTING_URL = NONE` to revert to default routing (verify on Microsoft Learn).
+
 ### Snapshot isolation remapping & tempdb version store
 
 Reads on a secondary are automatically run under **snapshot isolation** (row versioning) to avoid blocking redo, **regardless** of the isolation level the client requests — locking hints and higher isolation levels are silently remapped. Consequences:
-- Long-running secondary queries hold old row versions → the **tempdb version store on that secondary grows** and **ghost/version cleanup and redo can stall** (watch `redo_queue_size`).
-- A 14-byte versioning tag is added to rows as they are modified on the primary (one-time per-row overhead on first update after enabling readable secondaries).
+- Long-running secondary queries hold old row versions → the **tempdb version store on that secondary grows** and **ghost/version cleanup and redo can stall** (watch `redo_queue_size`). On the **primary**, a long secondary query can also block ghost-record cleanup and log truncation for disk-based tables.
+- Enabling a readable secondary adds a **14-byte versioning overhead** to **deleted, modified, or inserted** rows for disk-based tables on the primary (and it carries over to the secondary); this can cause page splits. The same 14-byte overhead also appears whenever snapshot isolation / RCSI is enabled on the primary, independent of readable secondaries. (Source: Microsoft Learn "Offload read-only workload to secondary replica".)
 - Monitor `sys.dm_tran_version_store_space_usage` and tempdb on each readable secondary.
 
 ## 6. Backups on Secondaries & `automated_backup_preference`
@@ -119,7 +139,9 @@ Reads on a secondary are automatically run under **snapshot isolation** (row ver
 Offload backups from the primary:
 
 ```sql
-ALTER AVAILABILITY GROUP [ag]
+-- [CONFIG CHANGE] Backup-preference is advisory metadata only; jobs must honor it via sys.fn_hadr_backup_is_preferred_replica.
+-- Setup step; run deliberately on the primary. Confirm the AG name.
+ALTER AVAILABILITY GROUP [MyAG]
 SET (AUTOMATED_BACKUP_PREFERENCE = SECONDARY);  -- PRIMARY | SECONDARY_ONLY | SECONDARY | NONE
 ```
 
@@ -135,10 +157,24 @@ Rules:
 - **One database**, **two replicas** (1 primary + 1 secondary), **no readable secondary**, **no backup on secondary**, no listener read-only routing across multiple secondaries. Sync or async. Create with `WITH (BASIC)`.
 
 ### Read-Scale AG (`CLUSTER_TYPE = NONE`, 2017+)
-- **No WSFC/Pacemaker** → **no automatic failover** and no clustered listener. Purely for **read scale-out** (or simple cross-platform replication). Failover is always manual (`FORCE_FAILOVER_ALLOW_DATA_LOSS` for role change). Works across Windows/Linux mixes.
+- **No WSFC/Pacemaker** → **no automatic failover** and no clustered listener. Purely for **read scale-out** (or simple cross-platform replication). Role change is always manual: a planned `ALTER AVAILABILITY GROUP … FAILOVER` between SYNCHRONIZED replicas (no loss), or `FORCE_FAILOVER_ALLOW_DATA_LOSS` (data-loss risk — see §5/dr-planning). Works across Windows/Linux mixes. Because there's no listener, use **read/write connection redirection** (above) so clients can reach the primary.
 
 ### Distributed Availability Group (2016+)
-- An **AG of AGs**: a primary AG (with its own primary replica) forwards to a secondary AG on another WSFC/cluster, possibly different region/OS. Used for cross-cluster DR, near-zero-downtime migrations (incl. Windows→Linux), and chaining. Each underlying AG retains its own listener; the distributed AG ties them together. Seeding and availability mode are configured at the distributed-AG level.
+- An **AG of AGs**: a primary AG (the **global primary**) forwards to a secondary AG (the **forwarder**) on another WSFC/cluster, possibly different region/OS. Used for cross-cluster DR, near-zero-downtime migrations (incl. Windows→Linux), and chaining. Each underlying AG retains its own listener; the distributed AG ties them together via each AG's **`LISTENER_URL`** (which points at the listener + the *database-mirroring endpoint port*, not the listener port). Seeding and availability mode are configured at the distributed-AG level.
+- Create on the global-primary cluster, then JOIN on the second cluster (both underlying AGs + listeners must already exist):
+  ```sql
+  -- [CONFIG CHANGE] Distributed AG setup. Run deliberately on the global-primary cluster. Placeholder names.
+  CREATE AVAILABILITY GROUP [MyDistributedAG]
+     WITH (DISTRIBUTED)
+     AVAILABILITY GROUP ON
+        'ag1' WITH (LISTENER_URL = N'tcp://ag1-listener.contoso.com:5022',
+                    AVAILABILITY_MODE = ASYNCHRONOUS_COMMIT, FAILOVER_MODE = MANUAL, SEEDING_MODE = AUTOMATIC),
+        'ag2' WITH (LISTENER_URL = N'tcp://ag2-listener.contoso.com:5022',
+                    AVAILABILITY_MODE = ASYNCHRONOUS_COMMIT, FAILOVER_MODE = MANUAL, SEEDING_MODE = AUTOMATIC);
+  -- Then on the SECOND cluster, join with the identical AVAILABILITY GROUP ON clause:
+  -- ALTER AVAILABILITY GROUP [MyDistributedAG] JOIN AVAILABILITY GROUP ON 'ag1' WITH (...), 'ag2' WITH (...);
+  ```
+- **Failover is always a manual, multi-step sequence** ending in `FORCE_FAILOVER_ALLOW_DATA_LOSS` on the forwarder — treat it as a **[DATA-LOSS RISK]** runbook (see `dr-planning.md` §5). The no-loss procedure: set both AGs to `SYNCHRONOUS_COMMIT`, wait for `SYNCHRONIZED` with matching `last_hardened_lsn`, set the global primary's distributed-AG `ROLE = SECONDARY` (the DAG goes unavailable), verify LSNs still match, then run `FORCE_FAILOVER_ALLOW_DATA_LOSS` on the forwarder. On 2022+ you can instead set `REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1` on the DAG to guarantee no loss. (Source: Microsoft Learn "Configure a Distributed Availability Group".)
 
 ### Contained Availability Group (2022+)
 - The AG contains its **own `master` and `msdb`** system databases, so **logins, SQL Agent jobs, linked servers, server-level objects** are replicated with the AG and survive failover automatically — solving the classic "forgot to script the logins/jobs" problem.
@@ -149,6 +185,7 @@ Rules:
 ### Endpoint prerequisite (every replica)
 See `mirroring-endpoints.md`. Briefly:
 ```sql
+-- [CONFIG CHANGE] + [SECURITY CHANGE] Endpoint create + CONNECT grant. Setup; run deliberately on each replica.
 CREATE ENDPOINT [Hadr_endpoint] STATE = STARTED
     AS TCP (LISTENER_PORT = 5022)
     FOR DATABASE_MIRRORING (ROLE = ALL, ENCRYPTION = REQUIRED ALGORITHM AES);
@@ -157,9 +194,12 @@ GRANT CONNECT ON ENDPOINT::[Hadr_endpoint] TO [CONTOSO\sqlsvc];
 
 ### Standard two-replica synchronous AG with automatic failover + listener (Windows/WSFC)
 ```sql
-CREATE AVAILABILITY GROUP [AG1]
+-- [CONFIG CHANGE] AG creation + join + seeding grant + listener. Setup; run deliberately, placeholder names.
+-- Confirm you are on the intended primary (CREATE/listener) vs secondary (JOIN/GRANT). No rollback besides DROP.
+CREATE AVAILABILITY GROUP [MyAG]
 WITH (AUTOMATED_BACKUP_PREFERENCE = SECONDARY,
       DB_FAILOVER = ON,
+      DTC_SUPPORT = NONE,                            -- PER_DB for cross-DB/distributed (MSDTC) transactions, see note below
       REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0)
 FOR DATABASE [Sales], [Inventory]
 REPLICA ON
@@ -177,18 +217,21 @@ REPLICA ON
       SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY));
 
 -- On the SECONDARY:
-ALTER AVAILABILITY GROUP [AG1] JOIN;
-ALTER AVAILABILITY GROUP [AG1] GRANT CREATE ANY DATABASE;   -- for automatic seeding
+ALTER AVAILABILITY GROUP [MyAG] JOIN;
+ALTER AVAILABILITY GROUP [MyAG] GRANT CREATE ANY DATABASE;   -- [SECURITY CHANGE] for automatic seeding
 
 -- Listener (on the primary):
-ALTER AVAILABILITY GROUP [AG1]
-ADD LISTENER N'AG1-LISTENER' (
+ALTER AVAILABILITY GROUP [MyAG]
+ADD LISTENER N'MyAG-LISTENER' (
     WITH IP ((N'10.0.0.50', N'255.255.255.0')),
     PORT = 1433);
 ```
 
+**`DTC_SUPPORT = PER_DB`** (vs `NONE`): set this when databases in the AG participate in **distributed / cross-database (MSDTC) transactions** that must survive failover — the engine creates a per-database resource manager whose RMID follows the database on failover so in-doubt transactions can resolve. Distributed-transaction support for AGs is **2016+**; on **2016 pre-SP2** you must drop and recreate the AG to change `DTC_SUPPORT`, whereas **2016 SP2 / 2017+** allow `ALTER AVAILABILITY GROUP … SET (DTC_SUPPORT = PER_DB)` after creation. (Source: Microsoft Learn "Configure distributed transactions for an availability group".)
+
 ### Read-scale AG with no cluster (2017+, cross-platform)
 ```sql
+-- [CONFIG CHANGE] Read-scale AG setup (no cluster). Run deliberately, placeholder names.
 CREATE AVAILABILITY GROUP [ReadScaleAG]
 WITH (CLUSTER_TYPE = NONE)
 FOR DATABASE [Reporting]
@@ -200,11 +243,13 @@ REPLICA ON
                    AVAILABILITY_MODE=SYNCHRONOUS_COMMIT, FAILOVER_MODE=MANUAL,
                    SEEDING_MODE=AUTOMATIC, SECONDARY_ROLE(ALLOW_CONNECTIONS=ALL));
 -- Manual role change only (no automatic failover without a cluster):
--- ALTER AVAILABILITY GROUP [ReadScaleAG] FORCE_FAILOVER_ALLOW_DATA_LOSS;
+-- [DATA-LOSS RISK] Forced role change CAN LOSE COMMITTED TRANSACTIONS — complete dr-planning.md §5 pre-flight first. TEMPLATE ONLY.
+-- ALTER AVAILABILITY GROUP [CONFIRM_AG_NAME] FORCE_FAILOVER_ALLOW_DATA_LOSS;
 ```
 
 ### Linux AG (Pacemaker, `CLUSTER_TYPE = EXTERNAL`)
 ```sql
+-- [CONFIG CHANGE] Linux/Pacemaker AG setup. Run deliberately, placeholder names. Endpoints are usually cert-auth.
 CREATE AVAILABILITY GROUP [AGLinux]
 WITH (CLUSTER_TYPE = EXTERNAL)
 FOR REPLICA ON
@@ -220,6 +265,7 @@ FOR REPLICA ON
 
 ### Basic AG (Standard, 2016+)
 ```sql
+-- [CONFIG CHANGE] Basic AG setup (Standard Edition). Run deliberately, placeholder names.
 CREATE AVAILABILITY GROUP [BasicAG]
 WITH (BASIC, DB_FAILOVER = ON, DTC_SUPPORT = NONE)
 FOR DATABASE [App]
@@ -248,7 +294,7 @@ estimated_send_lag_sec = log_send_queue_size / NULLIF(log_send_rate,0)
 estimated_redo_lag_sec = redo_queue_size      / NULLIF(redo_rate,0)
 ```
 Also compare `last_commit_time` and `last_hardened_lsn` across replicas (skew = effective RPO for async). Use `scripts/01-ag-health.sql` and `scripts/02-ag-failover-readiness.sql`. Common causes:
-- **High redo queue, low send queue** → secondary can't keep up applying (I/O/CPU, blocking reader). Parallel redo (2016+, on by default, up to limited threads) helps but a heavy readable workload can still stall it.
+- **High redo queue, low send queue** → secondary can't keep up applying (I/O/CPU, blocking reader). **Parallel redo** (2016+, on by default) helps but a heavy readable workload can still stall it. Thread limits: a SQL Server instance uses up to **100** parallel-redo threads total; each database uses up to **half the CPU cores, capped at 16 threads/DB**; if total demand would exceed 100, remaining databases fall back to a single (serial) redo thread. (Source: Microsoft Learn "AG secondary replica redo model and performance".)
 - **High send queue** → transport/network or an intentionally async DR replica.
 - **Sudden divergence** → a suspended database (`is_suspended = 1`, check `suspend_reason_desc`).
 
