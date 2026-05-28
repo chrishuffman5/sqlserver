@@ -3,7 +3,7 @@ name: sqlserver-engineering
 description: "SQL Server development and performance engineering: T-SQL best practices, indexing strategy (clustered, nonclustered, columnstore, filtered, covering/included), execution plans, query optimization, statistics and the cardinality estimator, parameter sniffing mitigation, partitioning, In-Memory OLTP, temporal tables, data compression, and schema design. WHEN: \"T-SQL\", \"write a query\", \"index\", \"covering index\", \"columnstore\", \"execution plan\", \"query plan\", \"query tuning\", \"optimize query\", \"SARGable\", \"cardinality estimator\", \"statistics\", \"parameter sniffing\", \"OPTION RECOMPILE\", \"partitioning\", \"In-Memory OLTP\", \"temporal table\", \"stored procedure\", \"schema design\", \"data type\", \"normalization\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Engineering (Development & Performance)

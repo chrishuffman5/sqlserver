@@ -3,7 +3,7 @@ name: sqlserver-advisor
 description: "Offline SQL Server analysis & recommendations engine: capture read-only system-view/DMV/catalog data from a target instance ONCE, land it as local CSV/Parquet, load it into DuckDB, and run an analysis query library that produces PRIORITIZED, EXPLAINED recommendations across table/schema design, indexing, table sizes & capacity, statistics, query hotspots, and configuration — the PerformanceMonitor 'Lite' pattern. Complements the live diagnostic skills; iterate analysis with zero further load on the source and trend across capture runs. WHEN: \"analyze my database\", \"recommendations to improve the database\", \"table design review\", \"what indexes am I missing\", \"unused/duplicate indexes\", \"is my schema well designed\", \"offline database analysis\", \"DuckDB SQL Server analysis\", \"database health report\", \"capacity review\", \"advisor\", \"prioritized findings\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server Advisor (Offline Analysis & Recommendations)

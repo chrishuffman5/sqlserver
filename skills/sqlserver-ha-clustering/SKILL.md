@@ -3,7 +3,7 @@ name: sqlserver-ha-clustering
 description: "SQL Server high availability, clustering, and disaster recovery: Always On Availability Groups (synchronous/asynchronous, contained, distributed, basic, read-scale), Failover Cluster Instances (FCI) on Windows Server Failover Clustering (WSFC), database mirroring and mirroring endpoints, log shipping, replication, quorum and witnesses, listeners, automatic seeding, and failover procedures. WHEN: \"Always On\", \"availability group\", \"AG\", \"readable secondary\", \"FCI\", \"failover cluster\", \"WSFC\", \"quorum\", \"witness\", \"database mirroring\", \"mirroring endpoint\", \"CREATE ENDPOINT\", \"log shipping\", \"replication\", \"distributor\", \"listener\", \"automatic seeding\", \"failover\", \"high availability\", \"disaster recovery\", \"DR\", \"RPO\", \"RTO\"."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # SQL Server High Availability, Clustering & Disaster Recovery
