@@ -2,30 +2,29 @@
 -- a99-recommendations.sql  —  the consolidated, prioritized recommendation set
 -- ---------------------------------------------------------------------
 -- PREREQUISITE: run analysis/00-load.sql first. This file is SELF-CONTAINED:
---   it re-issues the SELECT body of every analysis file a01..a10 (so you do
---   NOT need to .read the individual files), UNION ALLs them into the unified
---   findings shape, and emits:
+--   it re-issues the SELECT body of every analysis file a01..a17 (so you do
+--   NOT need to .read the individual files) into ONE temp view holding the
+--   unified findings shape, then emits:
 --     RESULT 1 — all findings, ordered by severity (High>Medium>Low) then dimension;
 --     RESULT 2 — a summary: counts by dimension x severity (+ totals).
+--   Because both results read the same advisor_findings view, they can never
+--   disagree — and each rule's logic lives exactly ONCE in this file.
 --
 -- Every recommendation is ADVISORY. Validate in a non-production copy, and
 -- follow the cross-referenced sibling skill (consult_skill) for the "how".
 -- Tags in recommendations: [SCHEMA CHANGE] / [INDEX MAINTENANCE] / [CONFIG
 -- CHANGE] / [INVESTIGATE] — never run a mutating statement blind in prod.
 --
--- The findings logic below is kept VERBATIM in sync with a01..a10; if you
+-- The findings logic below is kept VERBATIM in sync with a01..a17; if you
 -- edit an analysis file, mirror the change here (or just .read each file).
 -- =====================================================================
 
--- ---------------------------------------------------------------------
--- RESULT 1: prioritized findings
--- ---------------------------------------------------------------------
+CREATE OR REPLACE TEMP VIEW advisor_findings AS
 WITH server_uptime AS (
     SELECT server_name,
            date_diff('day', sqlserver_start_time, captured_at) AS uptime_days
     FROM server_info
-),
-findings AS (
+)
 
     -------------------------------------------------------------------
     -- a01: heaps, no-PK, forwarded records  (Table design)
@@ -451,6 +450,27 @@ findings AS (
         'Compressed backups are typically far smaller and faster to write/restore for a modest CPU cost — a near-universal win.',
         'sqlserver-infrastructure'
     FROM config c WHERE c.config_name = 'backup compression default' AND c.value_in_use = 0
+    UNION ALL
+    SELECT 'Configuration', NULL, '(instance)', 'High',
+        'max server memory (MB) = ' || c.value_in_use || ' (uncapped default); host_physical_memory_mb = '
+            || COALESCE(s.host_physical_memory_mb, 0),
+        'max server memory is at the uncapped default.',
+        'Cap it below physical RAM, leaving headroom for the OS and anything else on the host (a common starting point: total RAM minus 4 GB minus 1 GB per 8 GB of RAM; then observe). [CONFIG CHANGE]',
+        'Uncapped, the buffer pool grows until Windows/Linux is starved into paging — the whole box (including SQL Server itself) gets slower and less stable.',
+        'sqlserver-infrastructure'
+    FROM config c CROSS JOIN server_info s
+    WHERE c.config_name = 'max server memory (MB)' AND c.value_in_use >= 2147483647
+        AND s.engine_edition NOT IN (5, 6, 8)
+    UNION ALL
+    SELECT 'Configuration', NULL, '(instance)', 'Medium',
+        c.config_name || ' = ' || c.value_in_use,
+        'Legacy setting ''' || c.config_name || ''' is enabled.',
+        'Turn it off (value 0) in a maintenance window — both knobs are long-deprecated and are known to cause more harm than good on modern systems. [CONFIG CHANGE]',
+        CASE c.config_name
+             WHEN 'priority boost' THEN 'Priority boost elevates SQL Server threads above OS processes and can starve networking/kernel work, causing cluster failovers and stalls; Microsoft has deprecated it for years.'
+             ELSE 'Lightweight pooling (fiber mode) breaks CLR and several components for a workload class that essentially no longer exists; it is a legacy trap.' END,
+        'sqlserver-infrastructure'
+    FROM config c WHERE c.config_name IN ('priority boost', 'lightweight pooling') AND c.value_in_use = 1
 
     UNION ALL
     -------------------------------------------------------------------
@@ -503,11 +523,372 @@ findings AS (
         'Old compat levels lock out newer optimizer/IQP behavior, but raising it can shift plans — Query Store + staged testing is the safe path.',
         'sqlserver-engineering'
     FROM db_inventory d WHERE d.database_id > 4 AND d.compatibility_level < 150
-)
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a12: foreign-key trust & support  (Table design)
+    -------------------------------------------------------------------
+    SELECT 'Table design', fk.database_name,
+        fk.schema_name || '.' || fk.table_name || '.' || fk.fk_name,
+        CASE WHEN COALESCE(t.row_count, 0) >= 1000000 THEN 'High' ELSE 'Medium' END,
+        'is_not_trusted=true; child_rows=' || fmt_n(COALESCE(t.row_count, 0))
+            || '; references ' || fk.referenced_schema || '.' || fk.referenced_table,
+        'Foreign key is enabled but NOT TRUSTED (created/re-enabled WITH NOCHECK).',
+        'Re-validate it: ALTER TABLE ... WITH CHECK CHECK CONSTRAINT — after checking for existing violations; this scans the child table, so schedule it. [SCHEMA CHANGE]',
+        'An untrusted FK cannot be used by the optimizer for join elimination or cardinality, and rows violating it may already exist unnoticed.',
+        'sqlserver-engineering'
+    FROM foreign_keys fk
+    LEFT JOIN tables t ON t.database_name = fk.database_name AND t.schema_name = fk.schema_name
+        AND t.table_name = fk.table_name
+    WHERE fk.is_not_trusted = TRUE AND fk.is_disabled = FALSE
+    UNION ALL
+    SELECT 'Table design', fk.database_name,
+        fk.schema_name || '.' || fk.table_name || '.' || fk.fk_name,
+        CASE WHEN COALESCE(t.row_count, 0) >= 1000000 THEN 'High' ELSE 'Medium' END,
+        'is_disabled=true; child_rows=' || fmt_n(COALESCE(t.row_count, 0))
+            || '; references ' || fk.referenced_schema || '.' || fk.referenced_table,
+        'Foreign key is DISABLED — it enforces nothing.',
+        'Decide deliberately: re-enable WITH CHECK (validates existing rows, size-of-data scan) or drop it and document why integrity is enforced elsewhere. [SCHEMA CHANGE]',
+        'A disabled FK is silently allowing orphan rows; every day it stays off, cleanup gets harder and the constraint gets less re-enableable.',
+        'sqlserver-engineering'
+    FROM foreign_keys fk
+    LEFT JOIN tables t ON t.database_name = fk.database_name AND t.schema_name = fk.schema_name
+        AND t.table_name = fk.table_name
+    WHERE fk.is_disabled = TRUE
+    UNION ALL
+    SELECT 'Table design', fk.database_name,
+        fk.schema_name || '.' || fk.table_name || '.' || fk.fk_name,
+        'Low',
+        'on_delete=' || fk.delete_referential_action_desc
+            || '; on_update=' || fk.update_referential_action_desc
+            || '; child_rows=' || fmt_n(COALESCE(t.row_count, 0)),
+        'Cascading referential action on a large child table.',
+        'Review the blast radius: a single parent DELETE/UPDATE fans out into the child under one transaction. Consider application-managed or batched cleanup for very large children. [INVESTIGATE]',
+        'Cascades on big tables produce large, lock-heavy, log-heavy modifications that can escalate locks and block the system from one innocent-looking parent statement.',
+        'sqlserver-engineering'
+    FROM foreign_keys fk
+    JOIN tables t ON t.database_name = fk.database_name AND t.schema_name = fk.schema_name
+        AND t.table_name = fk.table_name
+    WHERE (fk.delete_referential_action_desc <> 'NO_ACTION' OR fk.update_referential_action_desc <> 'NO_ACTION')
+      AND t.row_count >= 1000000
+    UNION ALL
+    SELECT 'Table design', fk.database_name,
+        fk.schema_name || '.' || fk.table_name || '.' || fk.fk_name,
+        CASE WHEN COALESCE(t.row_count, 0) >= 100000 THEN 'Medium' ELSE 'Low' END,
+        'fk_columns=(' || fk.parent_column_list || '); child_rows=' || fmt_n(COALESCE(t.row_count, 0))
+            || '; no index leads on ' || trim(split_part(fk.parent_column_list, ',', 1)),
+        'Foreign-key column has no supporting index on the child table.',
+        'If the FK column is joined/filtered, or the parent sees DELETEs/UPDATEs, add a nonclustered index leading on the FK column(s) — do not add it reflexively otherwise. [SCHEMA CHANGE]',
+        'Unindexed FKs force child-table scans on parent deletes (and on FK joins), causing slow, lock-escalating referential checks.',
+        'sqlserver-engineering'
+    FROM foreign_keys fk
+    LEFT JOIN tables t ON t.database_name = fk.database_name AND t.schema_name = fk.schema_name
+        AND t.table_name = fk.table_name
+    WHERE fk.is_disabled = FALSE
+      AND NOT EXISTS (
+          SELECT 1 FROM indexes i
+          WHERE i.database_name = fk.database_name AND i.schema_name = fk.schema_name
+            AND i.table_name = fk.table_name AND i.key_column_list IS NOT NULL
+            AND trim(split_part(i.key_column_list, ',', 1)) = trim(split_part(fk.parent_column_list, ',', 1))
+      )
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a13: files, autogrowth, VLFs, tempdb layout  (Configuration / Sizing & capacity)
+    -------------------------------------------------------------------
+    SELECT 'Configuration', f.database_name, f.database_name || '.' || f.logical_name,
+        'Medium',
+        'growth=' || f.growth_value || '%; type=' || f.file_type_desc
+            || '; size=' || fmt_n(f.size_mb) || ' MB',
+        'File uses PERCENT autogrowth.',
+        'Switch to a fixed-MB growth increment sized for the file (commonly 256-1024 MB); pre-size the file so growth is the exception. [CONFIG CHANGE]',
+        'Percent growth compounds — each event is bigger and slower than the last, and log growths zero-fill synchronously, stalling every writer mid-transaction.',
+        'sqlserver-infrastructure'
+    FROM db_files f WHERE f.is_percent_growth = TRUE AND f.growth_value > 0
+    UNION ALL
+    SELECT 'Configuration', f.database_name, f.database_name || '.' || f.logical_name,
+        'Medium',
+        'growth=' || fmt_n(f.growth_value) || ' MB; type=' || f.file_type_desc
+            || '; size=' || fmt_n(f.size_mb) || ' MB',
+        'Sizable file grows in very small fixed increments.',
+        'Raise the growth increment (commonly 256-1024 MB for data, 256-512 MB for log) and pre-size to expected volume; enable instant file initialization for data files. [CONFIG CHANGE]',
+        'A 1-10 MB increment on a multi-GB file means constant micro-growth events — each one interrupts writers and (for logs) adds more tiny VLFs.',
+        'sqlserver-infrastructure'
+    FROM db_files f
+    WHERE f.is_percent_growth = FALSE AND f.growth_value > 0 AND f.growth_value < 64 AND f.size_mb >= 1024
+    UNION ALL
+    SELECT 'Sizing & capacity', f.database_name, f.database_name || '.' || f.logical_name,
+        'Medium',
+        'growth=0 (disabled); type=' || f.file_type_desc || '; size=' || fmt_n(f.size_mb) || ' MB',
+        'Autogrowth is DISABLED for this file.',
+        'Confirm this is deliberate (fixed-size provisioning with monitoring); otherwise enable a sane fixed-MB growth as the safety net. [CONFIG CHANGE]',
+        'With growth off, the file hard-stops at its current size — inserts fail (data) or the database halts (log) the moment it fills.',
+        'sqlserver-operations'
+    FROM db_files f WHERE f.growth_value = 0
+    UNION ALL
+    SELECT 'Sizing & capacity', f.database_name, f.database_name || '.' || f.logical_name,
+        CASE WHEN f.size_mb >= f.max_size_mb * 0.95 THEN 'High' ELSE 'Medium' END,
+        'size=' || fmt_n(f.size_mb) || ' MB of max=' || fmt_n(f.max_size_mb) || ' MB ('
+            || fmt_d(f.size_mb * 100.0 / NULLIF(f.max_size_mb, 0), 1) || '%); type=' || f.file_type_desc,
+        'File is at or near its MAXSIZE cap.',
+        'Raise or remove the cap (or archive/purge data) before it is hit; alert on file-full headroom, not after the error. [CONFIG CHANGE]',
+        'When the cap is reached the database throws 1105/9002 errors — data modifications stop until a human intervenes.',
+        'sqlserver-operations'
+    FROM db_files f
+    WHERE f.max_size_mb IS NOT NULL AND f.max_size_mb > 0
+      AND f.size_mb >= f.max_size_mb * 0.80 AND f.growth_value <> 0
+    UNION ALL
+    SELECT 'Configuration', f.database_name, f.database_name || '.' || f.logical_name,
+        CASE WHEN f.vlf_count >= 1000 THEN 'High' ELSE 'Medium' END,
+        'vlf_count=' || fmt_n(f.vlf_count) || '; log_size=' || fmt_n(f.size_mb) || ' MB',
+        'Transaction log has a high VLF count.',
+        'Shrink the log once to near-zero in a quiet window, then re-grow it in a few large fixed increments to its working size (this is the one legitimate shrink). [CONFIG CHANGE]',
+        'Thousands of tiny VLFs — the fingerprint of years of micro-growth — slow crash recovery, restores, replication, and log backups.',
+        'sqlserver-operations'
+    FROM db_files f WHERE f.vlf_count >= 300
+    UNION ALL
+    SELECT 'Configuration', 'tempdb', '(instance) tempdb',
+        CASE WHEN td.data_file_count = 1 THEN 'High' ELSE 'Medium' END,
+        'tempdb_data_files=' || td.data_file_count || '; host_cpu_count=' || s.host_cpu_count,
+        CASE WHEN td.data_file_count = 1
+             THEN 'tempdb has a single data file on a multi-core host.'
+             ELSE 'tempdb has fewer data files than the guideline for this core count.' END,
+        'Use one tempdb data file per logical CPU up to 8 (equal size, equal growth); check PAGELATCH_% waits on tempdb allocation pages to confirm pressure. [CONFIG CHANGE]',
+        'Concurrent tempdb allocations serialize on per-file allocation pages (PFS/GAM/SGAM); multiple equal files spread that contention.',
+        'sqlserver-infrastructure'
+    FROM (
+        SELECT COUNT(*) AS data_file_count FROM db_files
+        WHERE database_name = 'tempdb' AND file_type_desc = 'ROWS'
+    ) td
+    CROSS JOIN server_info s
+    WHERE s.host_cpu_count > 1 AND td.data_file_count > 0
+      AND td.data_file_count < LEAST(8, s.host_cpu_count)
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a14: backup & recovery cadence  (Configuration)
+    -------------------------------------------------------------------
+    SELECT 'Configuration', b.database_name, '(database) ' || b.database_name,
+        CASE WHEN COALESCE(d.database_id, 5) > 4 THEN 'High' ELSE 'Medium' END,
+        'last_full_backup=NULL; recovery_model=' || b.recovery_model_desc
+            || '; size=' || fmt_n(COALESCE(d.total_size_mb, 0)) || ' MB',
+        'Database has never had a full backup (none in msdb history).',
+        'Take a full backup now and schedule a cadence matched to the RPO; on managed platforms confirm the platform backup covers this DB. [INVESTIGATE]',
+        'Without a full backup there is no restore path at all — any corruption, deletion, or disaster is unrecoverable data loss.',
+        'sqlserver-operations'
+    FROM backup_history b
+    LEFT JOIN db_inventory d ON d.database_name = b.database_name
+    WHERE TRY_CAST(b.last_full_backup AS TIMESTAMP) IS NULL
+    UNION ALL
+    SELECT 'Configuration', b.database_name, '(database) ' || b.database_name,
+        CASE WHEN date_diff('day', TRY_CAST(b.last_full_backup AS TIMESTAMP), b.captured_at) > 30
+             THEN 'High' ELSE 'Medium' END,
+        'last_full_backup=' || CAST(b.last_full_backup AS VARCHAR)
+            || ' (' || date_diff('day', TRY_CAST(b.last_full_backup AS TIMESTAMP), b.captured_at) || ' days ago)'
+            || '; fulls_last_30d=' || b.full_backup_count_30d,
+        'Most recent full backup is stale.',
+        'Restore-test the newest backup you have, then fix the cadence (schedule, alert on failure); confirm the job did not silently stop. [INVESTIGATE]',
+        'Every day since the last full widens the restore gap; a backup job that quietly died is one of the most common findings behind real data loss.',
+        'sqlserver-operations'
+    FROM backup_history b
+    WHERE TRY_CAST(b.last_full_backup AS TIMESTAMP) IS NOT NULL
+      AND date_diff('day', TRY_CAST(b.last_full_backup AS TIMESTAMP), b.captured_at) > 7
+    UNION ALL
+    SELECT 'Configuration', b.database_name, '(database) ' || b.database_name, 'High',
+        'recovery_model=' || b.recovery_model_desc
+            || '; last_log_backup=' || COALESCE(CAST(b.last_log_backup AS VARCHAR), 'NEVER')
+            || '; log_backups_last_7d=' || b.log_backup_count_7d,
+        'FULL/BULK_LOGGED recovery model but log backups are missing or stale (> 24 h).',
+        'Either schedule frequent log backups (typically every 5-15 min, driven by RPO) or deliberately switch to SIMPLE if point-in-time recovery is not required. [CONFIG CHANGE]',
+        'In FULL recovery the log only truncates on log backup — without them the log grows until the disk fills, and the point-in-time recovery FULL exists for is not actually available.',
+        'sqlserver-operations'
+    FROM backup_history b
+    LEFT JOIN db_inventory d ON d.database_name = b.database_name
+    WHERE b.recovery_model_desc IN ('FULL', 'BULK_LOGGED')
+      AND COALESCE(d.database_id, 5) > 4
+      AND TRY_CAST(b.last_full_backup AS TIMESTAMP) IS NOT NULL
+      AND ( TRY_CAST(b.last_log_backup AS TIMESTAMP) IS NULL
+            OR date_diff('hour', TRY_CAST(b.last_log_backup AS TIMESTAMP), b.captured_at) > 24 )
+    UNION ALL
+    SELECT 'Configuration', d.database_name, '(database) ' || d.database_name,
+        CASE WHEN d.log_reuse_wait_desc = 'LOG_BACKUP' THEN 'High' ELSE 'Medium' END,
+        'log_reuse_wait=' || d.log_reuse_wait_desc || '; recovery_model=' || d.recovery_model_desc
+            || '; size=' || fmt_n(COALESCE(d.total_size_mb, 0)) || ' MB',
+        'Transaction-log reuse is blocked (' || d.log_reuse_wait_desc || ').',
+        CASE WHEN d.log_reuse_wait_desc = 'LOG_BACKUP'
+             THEN 'Take/schedule log backups so the log can truncate; see rule (3). [INVESTIGATE]'
+             ELSE 'Investigate the blocker: long-running/orphaned transaction, unsynchronized AG replica, stalled replication agent, or an active scan holding the log. [INVESTIGATE]' END,
+        'A blocked log cannot truncate — it grows until the disk fills and the database stops accepting writes (error 9002).',
+        'sqlserver-operations'
+    FROM db_inventory d
+    WHERE d.database_id > 4 AND d.state_desc = 'ONLINE'
+      AND d.log_reuse_wait_desc NOT IN ('NOTHING', 'CHECKPOINT')
+    UNION ALL
+    SELECT 'Configuration', d.database_name, '(database) ' || d.database_name, 'Low',
+        'recovery_model=SIMPLE; size=' || fmt_n(d.total_size_mb) || ' MB',
+        'Sizable database runs SIMPLE recovery — no point-in-time restore.',
+        'Confirm the business accepts losing everything since the last full/diff backup; if not, switch to FULL and add log backups. [CONFIG CHANGE]',
+        'SIMPLE recovery caps the restore point at the last full/differential — fine for rebuildable or staging data, silently dangerous for systems of record.',
+        'sqlserver-operations'
+    FROM db_inventory d
+    WHERE d.database_id > 4 AND d.recovery_model_desc = 'SIMPLE' AND d.total_size_mb >= 10240
+    UNION ALL
+    SELECT 'Configuration', b.database_name, '(database) ' || b.database_name, 'Low',
+        'last_full_has_checksum=0; last_full_backup=' || CAST(b.last_full_backup AS VARCHAR),
+        'Most recent full backup was taken without CHECKSUM.',
+        'Add WITH CHECKSUM to backup commands (or enable backup checksum default) and restore-test periodically — a backup is only as good as its last verified restore. [CONFIG CHANGE]',
+        'Without CHECKSUM, a backup can faithfully preserve corrupt pages and fail only at restore time — the worst possible moment to find out.',
+        'sqlserver-operations'
+    FROM backup_history b
+    WHERE TRY_CAST(b.last_full_backup AS TIMESTAMP) IS NOT NULL
+      AND COALESCE(TRY_CAST(b.last_full_has_checksum AS INTEGER), 1) = 0
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a15: per-statistic staleness  (Statistics)
+    -------------------------------------------------------------------
+    SELECT 'Statistics', s.database_name,
+        s.schema_name || '.' || s.table_name || '.' || s.stats_name,
+        CASE WHEN s.rows >= 1000000 AND s.modification_counter >= s.rows * 0.20
+             THEN 'High' ELSE 'Medium' END,
+        'mods=' || fmt_n(s.modification_counter) || ' vs rows=' || fmt_n(s.rows)
+            || ' (threshold~' || fmt_n(GREATEST(500, sqrt(1000.0 * s.rows))) || ')'
+            || '; last_updated=' || COALESCE(CAST(s.last_updated AS VARCHAR), 'NEVER'),
+        'Statistics are stale: modifications exceed the auto-update threshold.',
+        'UPDATE STATISTICS on this object (consider FULLSCAN for skewed/large tables) and check why auto-update has not fired — async off, NORECOMPUTE, or a workload that never recompiles. [INDEX MAINTENANCE]',
+        'The optimizer estimates cardinality from the last histogram; churn past the threshold means estimates (and therefore plans) are drifting from reality.',
+        'sqlserver-operations'
+    FROM stats_health s
+    WHERE s.modification_counter >= GREATEST(500, sqrt(1000.0 * s.rows))
+    UNION ALL
+    SELECT 'Statistics', s.database_name,
+        s.schema_name || '.' || s.table_name || '.' || s.stats_name, 'Low',
+        'last_updated=' || CAST(s.last_updated AS VARCHAR)
+            || ' (' || date_diff('day', TRY_CAST(s.last_updated AS TIMESTAMP), s.captured_at) || ' days ago)'
+            || '; mods=' || fmt_n(s.modification_counter) || '; rows=' || fmt_n(s.rows),
+        'Statistics have not been updated in over 90 days despite modifications.',
+        'Fold this object into the regular stats-maintenance job (e.g. Ola Hallengren IndexOptimize @UpdateStatistics) rather than waiting for the auto-update threshold. [INDEX MAINTENANCE]',
+        'Slow-churn tables can sit below the auto-update threshold for months while their histograms age badly — scheduled maintenance covers what auto-update misses.',
+        'sqlserver-operations'
+    FROM stats_health s
+    WHERE TRY_CAST(s.last_updated AS TIMESTAMP) IS NOT NULL
+      AND date_diff('day', TRY_CAST(s.last_updated AS TIMESTAMP), s.captured_at) > 90
+      AND s.modification_counter > 0
+      AND s.modification_counter < GREATEST(500, sqrt(1000.0 * s.rows))
+    UNION ALL
+    SELECT 'Statistics', s.database_name,
+        s.schema_name || '.' || s.table_name || '.' || s.stats_name, 'Low',
+        'sample=' || fmt_d(s.sample_pct, 2) || '% (' || fmt_n(s.rows_sampled) || ' of '
+            || fmt_n(s.rows) || ' rows)',
+        'Statistics on a large table were built from a very small sample.',
+        'If plans on this table misestimate, UPDATE STATISTICS ... WITH FULLSCAN (or a persisted higher sample rate, SQL 2016 SP1 CU4+) and compare estimates. [INDEX MAINTENANCE]',
+        'A sub-5% sample can miss skew and produce histograms that misestimate hot values — a common root cause of bad plans on big tables.',
+        'sqlserver-operations'
+    FROM stats_health s
+    WHERE s.rows >= 1000000 AND s.sample_pct IS NOT NULL AND s.sample_pct < 5
+    UNION ALL
+    SELECT 'Statistics', s.database_name,
+        s.schema_name || '.' || s.table_name || '.' || s.stats_name, 'Medium',
+        'no_recompute=true; mods=' || fmt_n(s.modification_counter)
+            || '; last_updated=' || COALESCE(CAST(s.last_updated AS VARCHAR), 'NEVER'),
+        'Statistic is marked NORECOMPUTE (frozen out of auto-update).',
+        'Confirm a manual stats job demonstrably refreshes it; otherwise re-enable auto-update (UPDATE STATISTICS without NORECOMPUTE / recreate the stat). [CONFIG CHANGE]',
+        'NORECOMPUTE is only safe under a managed stats regime — without one, this statistic silently decays forever.',
+        'sqlserver-operations'
+    FROM stats_health s WHERE s.no_recompute = TRUE
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a16: identity & sequence exhaustion  (Table design)
+    -------------------------------------------------------------------
+    SELECT 'Table design', i.database_name,
+        i.schema_name || '.' || i.table_name || COALESCE('.' || i.column_name, ''),
+        CASE WHEN i.pct_used >= 90 THEN 'High'
+             WHEN i.pct_used >= 70 THEN 'Medium' ELSE 'Low' END,
+        i.object_type || ' ' || i.data_type
+            || '; last_value=' || fmt_n(i.last_value)
+            || ' of max=' || fmt_n(i.max_value)
+            || ' (' || fmt_d(i.pct_used, 1) || '% used)'
+            || '; increment=' || i.increment_value,
+        CASE WHEN i.pct_used >= 90
+             THEN i.object_type || ' is nearly exhausted — INSERTs will start failing at the type maximum.'
+             ELSE i.object_type || ' has consumed a significant share of its range.' END,
+        'Plan the fix before it is an outage: widen the type (int -> bigint is a size-of-data rebuild — schedule it), or reseed into the unused negative range as a stopgap if the app tolerates negative IDs. [SCHEMA CHANGE]',
+        'When an identity/sequence passes its type maximum every INSERT fails with error 8115 — a total write outage with zero prior symptoms, on a date you can compute today.',
+        'sqlserver-engineering'
+    FROM identity_columns i
+    WHERE i.pct_used IS NOT NULL AND i.is_cycling = FALSE AND i.pct_used >= 50
+
+    UNION ALL
+    -------------------------------------------------------------------
+    -- a17: waits context  (Configuration)
+    -------------------------------------------------------------------
+    SELECT 'Configuration', NULL, '(instance) wait: ' || w.wait_type,
+        CASE WHEN w.pct_of_total >= 50 THEN 'High' ELSE 'Medium' END,
+        'pct_of_total=' || fmt_d(w.pct_of_total, 1) || '%; wait_time='
+            || fmt_n(w.wait_time_ms) || ' ms; tasks=' || fmt_n(w.waiting_tasks_count)
+            || '; uptime=' || COALESCE(u.uptime_days, 0) || 'd',
+        'One wait type dominates the (benign-filtered) wait profile since restart.',
+        CASE
+            WHEN w.wait_type IN ('CXPACKET', 'CXCONSUMER')
+                THEN 'Parallelism waits: raise cost threshold for parallelism and bound MAXDOP (see a10), then re-measure — do not chase CXPACKET itself. [INVESTIGATE]'
+            WHEN starts_with(w.wait_type, 'PAGEIOLATCH_')
+                THEN 'Buffer reads from disk: check memory pressure (page life), missing/covering indexes driving scans (a06/a09), and storage latency. [INVESTIGATE]'
+            WHEN w.wait_type = 'WRITELOG'
+                THEN 'Log-flush latency: check log-disk write latency, VLF health (a13), tiny commits/no batching, and synchronous AG/mirroring overhead. [INVESTIGATE]'
+            WHEN starts_with(w.wait_type, 'LCK_')
+                THEN 'Lock waits: find the blocking chains live (sqlserver-monitoring), then fix the holder — long transactions, missing indexes, or isolation choices (RCSI, a11). [INVESTIGATE]'
+            WHEN w.wait_type = 'RESOURCE_SEMAPHORE'
+                THEN 'Memory-grant queueing: hunt over-granting queries (a09 grants), fix cardinality misestimates, and review max server memory. [INVESTIGATE]'
+            WHEN starts_with(w.wait_type, 'PAGELATCH_')
+                THEN 'In-memory allocation contention (often tempdb PFS/GAM/SGAM): check tempdb data-file count (a13) and hot-page patterns (last-page insert). [INVESTIGATE]'
+            WHEN w.wait_type = 'ASYNC_NETWORK_IO'
+                THEN 'The CLIENT is consuming results slowly: look at app-side row-by-row processing and oversized result sets — this is rarely a server problem. [INVESTIGATE]'
+            WHEN starts_with(w.wait_type, 'HADR_')
+                THEN 'Availability-group synchronization: check replica health, network latency, and sync-commit cost (sqlserver-ha-clustering). [INVESTIGATE]'
+            ELSE 'Identify the wait class in the wait-type reference (sqlserver-monitoring) and confirm live before acting — a snapshot ranks classes, it does not diagnose. [INVESTIGATE]'
+        END,
+        'The dominant wait names the bottleneck CLASS the instance spends its time on — it tells you which subsystem to investigate first, not which knob to turn.',
+        CASE
+            WHEN w.wait_type IN ('CXPACKET', 'CXCONSUMER')  THEN 'sqlserver-infrastructure'
+            WHEN w.wait_type = 'WRITELOG'                   THEN 'sqlserver-infrastructure'
+            WHEN starts_with(w.wait_type, 'PAGELATCH_')     THEN 'sqlserver-infrastructure'
+            WHEN w.wait_type = 'RESOURCE_SEMAPHORE'         THEN 'sqlserver-engineering'
+            ELSE 'sqlserver-monitoring'
+        END
+    FROM wait_stats w
+    LEFT JOIN server_uptime u ON u.server_name = w.server_name
+    WHERE w.pct_of_total >= 25
+    UNION ALL
+    SELECT 'Configuration', NULL, '(instance)', 'Medium',
+        'signal_wait_ratio=' || fmt_d(r.signal_ratio * 100, 1) || '% ('
+            || fmt_n(r.signal_ms) || ' of ' || fmt_n(r.total_ms) || ' ms)'
+            || '; uptime=' || COALESCE(r.uptime_days, 0) || 'd',
+        'High signal-wait ratio: threads are runnable but queueing for a scheduler (CPU pressure).',
+        'Reduce CPU demand before adding CPUs: tune the top CPU queries (a09), bound parallelism (a10), and confirm with live scheduler/runnable-task counts. [INVESTIGATE]',
+        'Signal wait is time spent READY but not RUNNING — a high share means the CPUs cannot keep up with runnable work, independent of what the work waits on.',
+        'sqlserver-infrastructure'
+    FROM (
+        SELECT SUM(w.signal_wait_time_ms) AS signal_ms,
+               SUM(w.wait_time_ms)        AS total_ms,
+               SUM(w.signal_wait_time_ms) * 1.0 / NULLIF(SUM(w.wait_time_ms), 0) AS signal_ratio,
+               MAX(u.uptime_days)         AS uptime_days
+        FROM wait_stats w
+        LEFT JOIN (
+            SELECT server_name, date_diff('day', sqlserver_start_time, captured_at) AS uptime_days
+            FROM server_info
+        ) u ON u.server_name = w.server_name
+    ) r
+    WHERE r.signal_ratio >= 0.25
+;
+
+-- ---------------------------------------------------------------------
+-- RESULT 1: prioritized findings
+-- ---------------------------------------------------------------------
 SELECT
     dimension, database_name, object_name, severity,
     metric, finding, recommendation, why, consult_skill
-FROM findings
+FROM advisor_findings
 ORDER BY
     CASE severity WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END,
     dimension,
@@ -516,196 +897,9 @@ ORDER BY
 
 -- ---------------------------------------------------------------------
 -- RESULT 2: summary — counts by dimension x severity (+ row totals).
--- Re-derives the same findings set via a temp view so the counts always
--- match RESULT 1. (Build the view once; it persists for the session.)
+-- Reads the SAME advisor_findings view as RESULT 1, so the counts always
+-- match. (GROUPING SETS keeps it standard + portable.)
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE TEMP VIEW advisor_findings AS
-WITH server_uptime AS (
-    SELECT server_name, date_diff('day', sqlserver_start_time, captured_at) AS uptime_days
-    FROM server_info
-)
-SELECT 'Table design' AS dimension, t.database_name,
-    t.schema_name || '.' || t.table_name AS object_name,
-    CASE WHEN t.row_count >= 1000000 THEN 'High'
-         WHEN t.row_count >= 100000 THEN 'Medium' ELSE 'Low' END AS severity
-FROM tables t WHERE t.is_heap = TRUE AND t.row_count >= 100000
-UNION ALL
-SELECT 'Table design', t.database_name, t.schema_name || '.' || t.table_name,
-    CASE WHEN t.row_count >= 1000000 THEN 'High'
-         WHEN t.row_count >= 10000 THEN 'Medium' ELSE 'Low' END
-FROM tables t WHERE t.has_primary_key = FALSE
-UNION ALL
-SELECT 'Table design', p.database_name, p.schema_name || '.' || p.table_name,
-    CASE WHEN p.forwarded_record_count >= 100000 THEN 'High'
-         WHEN p.forwarded_record_count >= 1000 THEN 'Medium' ELSE 'Low' END
-FROM index_physical p WHERE p.index_id = 0 AND p.forwarded_record_count > 0
-UNION ALL
-SELECT 'Table design', i.database_name, i.schema_name || '.' || i.table_name || '.' || i.index_name, 'Medium'
-FROM indexes i WHERE i.index_type_desc = 'CLUSTERED' AND i.is_unique = FALSE
-UNION ALL
-SELECT 'Table design', i.database_name, i.schema_name || '.' || i.table_name || '.' || i.index_name, 'High'
-FROM indexes i
-JOIN columns c ON c.database_name = i.database_name AND c.schema_name = i.schema_name
-    AND c.table_name = i.table_name AND c.column_name = trim(split_part(i.key_column_list, ',', 1))
-WHERE i.index_type_desc = 'CLUSTERED' AND i.key_column_list IS NOT NULL
-    AND regexp_matches(c.data_type, '(?i)uniqueidentifier|guid')
-UNION ALL
-SELECT 'Table design', k.database_name, k.schema_name || '.' || k.table_name || '.' || k.index_name,
-    CASE WHEN k.key_bytes >= 200 THEN 'High' ELSE 'Medium' END
-FROM (
-    SELECT i.database_name, i.schema_name, i.table_name, i.index_name, SUM(c.max_length_bytes) AS key_bytes
-    FROM indexes i
-    JOIN columns c ON c.database_name = i.database_name AND c.schema_name = i.schema_name
-        AND c.table_name = i.table_name
-        AND (', ' || i.key_column_list || ', ') LIKE '%, ' || c.column_name || ', %'
-    WHERE i.index_type_desc = 'CLUSTERED' AND i.key_column_list IS NOT NULL
-    GROUP BY i.database_name, i.schema_name, i.table_name, i.index_name
-) k WHERE k.key_bytes >= 100
-UNION ALL
-SELECT 'Table design', t.database_name, t.schema_name || '.' || t.table_name, 'Medium'
-FROM tables t WHERE t.is_heap = TRUE AND t.row_count >= 500000
-UNION ALL
-SELECT 'Table design', c.database_name, c.schema_name || '.' || c.table_name || '.' || c.column_name, 'Low'
-FROM columns c WHERE regexp_matches(c.data_type, '(?i)varchar|nvarchar|varbinary') AND c.max_length_bytes = -1
-UNION ALL
-SELECT 'Table design', c.database_name, c.schema_name || '.' || c.table_name || '.' || c.column_name, 'Medium'
-FROM columns c WHERE lower(c.data_type) IN ('text','ntext','image')
-UNION ALL
-SELECT 'Table design', fk.database_name, fk.schema_name || '.' || fk.table_name || '.' || fk.fk_name, 'High'
-FROM foreign_keys fk
-JOIN columns pc ON pc.database_name = fk.database_name AND pc.schema_name = fk.schema_name
-    AND pc.table_name = fk.table_name AND pc.column_name = trim(split_part(fk.parent_column_list, ',', 1))
-JOIN columns rc ON rc.database_name = fk.database_name AND rc.schema_name = fk.referenced_schema
-    AND rc.table_name = fk.referenced_table AND rc.column_name = trim(split_part(fk.referenced_column_list, ',', 1))
-WHERE lower(pc.data_type) <> lower(rc.data_type) OR pc.max_length_bytes <> rc.max_length_bytes
-UNION ALL
-SELECT 'Table design', w.database_name, w.schema_name || '.' || w.table_name, 'Medium'
-FROM (
-    SELECT database_name, schema_name, table_name,
-           SUM(CASE WHEN max_length_bytes > 0 THEN max_length_bytes ELSE 0 END) AS row_bytes
-    FROM columns GROUP BY database_name, schema_name, table_name
-) w WHERE w.row_bytes > 8060
-UNION ALL
-SELECT 'Table design', n.database_name, n.schema_name || '.' || n.table_name, 'Low'
-FROM (
-    SELECT database_name, schema_name, table_name, COUNT(*) AS col_count,
-           SUM(CASE WHEN is_nullable THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS nullable_ratio
-    FROM columns GROUP BY database_name, schema_name, table_name
-) n WHERE n.col_count >= 10 AND n.nullable_ratio >= 0.8
-UNION ALL
-SELECT 'Indexing', iu.database_name, iu.schema_name || '.' || iu.table_name || '.' || iu.index_name,
-    CASE WHEN COALESCE(u.uptime_days,0) < 7 THEN 'Low'
-         WHEN iu.user_updates >= 100000 THEN 'High'
-         WHEN iu.user_updates >= 1000 THEN 'Medium' ELSE 'Low' END
-FROM index_usage iu
-JOIN indexes i ON i.database_name = iu.database_name AND i.schema_name = iu.schema_name
-    AND i.table_name = iu.table_name AND i.index_id = iu.index_id
-LEFT JOIN server_uptime u ON u.server_name = iu.server_name
-WHERE i.index_type_desc = 'NONCLUSTERED' AND i.is_primary_key = FALSE
-    AND i.is_unique_constraint = FALSE AND i.is_disabled = FALSE AND iu.user_updates > 0
-    AND ( (iu.user_seeks + iu.user_scans + iu.user_lookups) = 0
-          OR ( iu.user_updates >= 1000
-               AND (iu.user_seeks + iu.user_scans + iu.user_lookups) < iu.user_updates * 0.01 ) )
-UNION ALL
-SELECT 'Indexing', i.database_name, i.schema_name || '.' || i.table_name || '.' || i.index_name, 'Medium'
-FROM indexes i WHERE i.is_disabled = TRUE
-UNION ALL
-SELECT 'Indexing', a.database_name, a.schema_name || '.' || a.table_name || '.' || a.index_name, 'High'
-FROM indexes a
-JOIN indexes b ON a.database_name = b.database_name AND a.schema_name = b.schema_name
-    AND a.table_name = b.table_name AND a.object_id = b.object_id AND a.index_name < b.index_name
-    AND a.key_column_list = b.key_column_list
-    AND COALESCE(a.included_column_list,'') = COALESCE(b.included_column_list,'')
-WHERE a.index_type_desc IN ('NONCLUSTERED','CLUSTERED') AND a.key_column_list IS NOT NULL
-UNION ALL
-SELECT 'Indexing', narrow.database_name, narrow.schema_name || '.' || narrow.table_name || '.' || narrow.index_name, 'Medium'
-FROM indexes narrow
-JOIN indexes wide ON narrow.database_name = wide.database_name AND narrow.schema_name = wide.schema_name
-    AND narrow.table_name = wide.table_name AND narrow.object_id = wide.object_id
-    AND narrow.index_id <> wide.index_id
-    AND length(narrow.key_column_list) < length(wide.key_column_list)
-    AND (wide.key_column_list || ', ') LIKE (narrow.key_column_list || ', %')
-WHERE narrow.index_type_desc = 'NONCLUSTERED' AND wide.index_type_desc = 'NONCLUSTERED'
-    AND narrow.key_column_list IS NOT NULL AND wide.key_column_list IS NOT NULL
-    AND narrow.key_column_list <> wide.key_column_list
-UNION ALL
-SELECT 'Indexing', r.database_name, r.schema_name || '.' || r.table_name,
-    CASE WHEN r.improvement_measure >= 100000 THEN 'High'
-         WHEN r.improvement_measure >= 10000 THEN 'Medium' ELSE 'Low' END
-FROM (SELECT mi.*, ROW_NUMBER() OVER (ORDER BY mi.improvement_measure DESC) AS rn FROM missing_indexes mi) r
-WHERE r.rn <= 25
-UNION ALL
-SELECT 'Indexing', p.database_name,
-    p.schema_name || '.' || p.table_name || '.' || COALESCE(p.index_name,'(heap)'),
-    CASE WHEN p.avg_fragmentation_in_percent > 30 AND p.page_count >= 100000 THEN 'High'
-         WHEN p.avg_fragmentation_in_percent > 30 THEN 'Medium' ELSE 'Low' END
-FROM index_physical p WHERE p.page_count >= 1000 AND p.avg_fragmentation_in_percent >= 10
-UNION ALL
-SELECT 'Sizing & capacity', b.database_name, b.schema_name || '.' || b.table_name,
-    CASE WHEN b.total_space_mb >= 51200 THEN 'High'
-         WHEN b.total_space_mb >= 10240 THEN 'Medium' ELSE 'Low' END
-FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY total_space_mb DESC) AS rn FROM tables) b WHERE b.rn <= 20
-UNION ALL
-SELECT 'Sizing & capacity', t.database_name, t.schema_name || '.' || t.table_name,
-    CASE WHEN t.unused_space_mb >= 10240 THEN 'High'
-         WHEN t.unused_space_mb >= 1024 THEN 'Medium' ELSE 'Low' END
-FROM tables t WHERE t.unused_space_mb >= 1024 AND t.unused_space_mb > t.total_space_mb * 0.20
-UNION ALL
-SELECT 'Sizing & capacity', t.database_name, t.schema_name || '.' || t.table_name,
-    CASE WHEN t.total_space_mb >= 10240 THEN 'Medium' ELSE 'Low' END
-FROM tables t WHERE COALESCE(t.data_compression_desc,'NONE') = 'NONE' AND t.total_space_mb >= 1024
-UNION ALL
-SELECT 'Sizing & capacity', t.database_name, t.schema_name || '.' || t.table_name, 'Medium'
-FROM tables t WHERE t.total_space_mb >= 51200 AND t.partition_count <= 1
-UNION ALL
-SELECT 'Sizing & capacity', t.database_name, t.schema_name || '.' || t.table_name,
-    CASE WHEN t.index_space_mb >= 10240 THEN 'Medium' ELSE 'Low' END
-FROM tables t WHERE t.data_space_mb >= 100 AND t.index_space_mb > t.data_space_mb * 2
-UNION ALL
-SELECT 'Query hotspots', COALESCE(q.database_name,'(unknown)'), 'query_hash ' || q.query_hash,
-    CASE WHEN q.rn <= 3 THEN 'High' WHEN q.rn <= 8 THEN 'Medium' ELSE 'Low' END
-FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY total_worker_time_ms DESC) AS rn FROM query_stats) q WHERE q.rn <= 15
-UNION ALL
-SELECT 'Query hotspots', COALESCE(q.database_name,'(unknown)'), 'query_hash ' || q.query_hash,
-    CASE WHEN q.rn <= 3 THEN 'High' WHEN q.rn <= 8 THEN 'Medium' ELSE 'Low' END
-FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY total_logical_reads DESC) AS rn FROM query_stats) q WHERE q.rn <= 15
-UNION ALL
-SELECT 'Query hotspots', COALESCE(q.database_name,'(unknown)'), 'query_hash ' || q.query_hash, 'High'
-FROM query_stats q WHERE q.avg_elapsed_time_ms >= 100 AND q.execution_count >= 1000
-UNION ALL
-SELECT 'Configuration', NULL, '(instance)', 'Medium'
-FROM config c WHERE c.config_name = 'cost threshold for parallelism' AND c.value_in_use = 5
-UNION ALL
-SELECT 'Configuration', NULL, '(instance)', CASE WHEN s.host_cpu_count >= 16 THEN 'High' ELSE 'Medium' END
-FROM config c CROSS JOIN server_info s
-WHERE c.config_name = 'max degree of parallelism' AND c.value_in_use = 0 AND s.host_cpu_count > 1
-UNION ALL
-SELECT 'Configuration', NULL, '(instance)', 'Low'
-FROM config c WHERE c.config_name = 'optimize for ad hoc workloads' AND c.value_in_use = 0
-UNION ALL
-SELECT 'Configuration', NULL, '(instance)', 'Low'
-FROM config c WHERE c.config_name = 'backup compression default' AND c.value_in_use = 0
-UNION ALL
-SELECT 'Statistics', d.database_name, '(database) ' || d.database_name, 'Medium'
-FROM db_inventory d WHERE d.database_id > 4 AND d.is_auto_update_stats_on = FALSE
-UNION ALL
-SELECT 'Statistics', d.database_name, '(database) ' || d.database_name, 'Medium'
-FROM db_inventory d WHERE d.database_id > 4 AND d.is_auto_create_stats_on = FALSE
-UNION ALL
-SELECT 'Statistics', d.database_name, '(database) ' || d.database_name, 'Low'
-FROM db_inventory d WHERE d.database_id > 4 AND d.is_auto_update_stats_on = TRUE AND d.is_auto_update_stats_async_on = FALSE AND d.total_size_mb >= 10240
-UNION ALL
-SELECT 'Configuration', d.database_name, '(database) ' || d.database_name, 'Medium'
-FROM db_inventory d WHERE d.database_id > 4 AND COALESCE(d.page_verify_option_desc,'NONE') <> 'CHECKSUM'
-UNION ALL
-SELECT 'Configuration', d.database_name, '(database) ' || d.database_name, 'Low'
-FROM db_inventory d WHERE d.database_id > 4 AND d.is_read_committed_snapshot_on = FALSE
-UNION ALL
-SELECT 'Configuration', d.database_name, '(database) ' || d.database_name, 'Low'
-FROM db_inventory d WHERE d.database_id > 4 AND d.compatibility_level < 150;
-
--- counts by dimension x severity, with a ROLLUP-style total row per dimension
--- and a grand total. (GROUPING SETS keeps it standard + portable.)
 SELECT
     COALESCE(dimension, 'ALL DIMENSIONS')         AS dimension,
     COALESCE(severity,  'ALL')                    AS severity,
