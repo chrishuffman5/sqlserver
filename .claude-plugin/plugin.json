@@ -1,7 +1,7 @@
 {
   "name": "sqlserver",
   "description": "Dedicated Microsoft SQL Server expert plugin covering the full scope of database management — operations, monitoring, HA/clustering, availability groups, mirroring endpoints, engineering, infrastructure, cloud offerings, security/authentication, and an offline DuckDB-powered analysis & recommendations advisor — across versions 2016-2025 and the Azure SQL / AWS RDS / Google Cloud SQL families.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Christopher Huffman",
     "email": "chrishuffman85@gmail.com"

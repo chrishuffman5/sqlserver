@@ -1,6 +1,6 @@
 # Recommendation Rule Catalog
 
-The rule library that runs inside DuckDB against the captured data (see `duckdb-analysis.md` for how to load and run it). Each analysis file `a01..a10` emits the **unified findings shape** (`dimension, database_name, object_name, severity, metric, finding, recommendation, why, consult_skill`); `a99` consolidates and prioritizes them.
+The rule library that runs inside DuckDB against the captured data (see `duckdb-analysis.md` for how to load and run it). Each analysis file `a01..a17` emits the **unified findings shape** (`dimension, database_name, object_name, severity, metric, finding, recommendation, why, consult_skill`); `a99` consolidates and prioritizes them. **Section numbers below match the analysis file names exactly** — `a04` here is `analysis/a04-index-unused.sql`.
 
 > **Everything here is ADVISORY.** A capture is a single point-in-time snapshot of DMV/catalog data — it does not know your workload's intent, your maintenance windows, your month-end jobs, or your business SLAs. **Validate every recommendation in a non-production environment before acting.** Remediation T-SQL is *not* the job of this skill: it lives in the deeper skills and follows the plugin **change-class convention** — mutating examples are tagged `[SCHEMA CHANGE]` / `[CONFIG CHANGE]` / `[DATA-LOSS RISK]`, and destructive commands are never inlined as runnable. The collectors that produced the capture are strictly read-only.
 
@@ -10,209 +10,271 @@ The rule library that runs inside DuckDB against the captured data (see `duckdb-
 
 ---
 
-## a01 — Table Design (heaps, missing PKs, wide/odd columns)
+## a01 — Table Design: Heaps, Missing PKs, Forwarded Records
 
-Reads `tables`, `columns`, `indexes`.
+Reads `tables`, `index_physical`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Heap with significant rows** | `tables.is_heap = 1` and `row_count` high | `row_count >= 100,000` | High if `>= 1,000,000` and has nonclustered indexes (NCIs carry RID locators); else Medium | Evaluate a clustered index (narrow, unique, static, ever-increasing key) | Heaps cause forwarded records, full scans, and fat NCI RID locators |
-| **Large table, no primary key** | `tables.has_primary_key = 0` and `row_count` high | `row_count >= 10,000` | Medium | Add a PK / enforce entity integrity | No PK → no enforced uniqueness, weak referential model, replication/AG friction |
-| **Over-wide table** | many rows in `columns` for one `object_id` | `column_count >= 50` | Low (Medium if also many `nvarchar(max)`/`varchar(max)`) | Review for normalization / vertical partitioning | Wide rows reduce page density and inflate I/O |
-| **Suspect data types** | `columns.data_type` heuristics | any of: `text`/`ntext`/`image` (deprecated); `float`/`real` for money; `nvarchar` where `varchar` suffices on ASCII; `(max)` used as a default | Low–Medium | Replace deprecated LOB types with `varchar(max)`/`nvarchar(max)`/`varbinary(max)`; use `decimal` for currency; size strings deliberately | Deprecated types block features; oversized types waste space and break SARGability |
-| **GUID clustered key** | join `indexes` (clustered, key includes a `uniqueidentifier` column from `columns`) | clustered key leads with a GUID column | Medium | Consider a sequential surrogate or `NEWSEQUENTIALID()` | Random GUID cluster keys cause page splits + fragmentation and bloat every NCI |
+| **Heap with significant rows** | `tables.is_heap` and `row_count` high | `row_count >= 100,000` | High `>= 1,000,000`; else Medium | Evaluate a clustered index (narrow, unique, static, ever-increasing key) | Heaps cause forwarded records, IAM-chain scans, and fat NCI RID locators |
+| **Table with no primary key** | `tables.has_primary_key = 0` | any (severity scales with rows) | High `>= 1,000,000`; Medium `>= 10,000`; else Low | Add a PK / enforce entity integrity | No PK → no enforced uniqueness, weak referential model, replication/AG friction |
+| **Heap accumulating forwarded records** | `index_physical.forwarded_record_count > 0` on `index_id = 0` | any (severity scales) | High `>= 100,000`; Medium `>= 1,000` | Add a clustered index, or interim `ALTER TABLE ... REBUILD` | Each forwarded record costs an extra page read on every access |
 
-**Caveats.** A heap is fine for tiny lookup/staging tables and some bulk-load patterns — don't blanket-cluster everything. "No PK" may be intentional for staging. Data-type changes are size-of-data `[SCHEMA CHANGE]`s and can break application contracts — verify usage first. `consult_skill = sqlserver-engineering` (schema-design.md / indexing.md).
+**Caveats.** A heap is fine for tiny lookup/staging tables and some bulk-load patterns — don't blanket-cluster everything. "No PK" may be intentional for staging. `consult_skill = sqlserver-engineering`.
 
 ---
 
-## a02 — Indexing: Unused, Duplicate & Overlapping
+## a02 — Table Design: Clustered-Key Smells
 
-Reads `indexes`, `index_usage`.
+Reads `indexes`, `columns`, `tables`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Unused index with write cost** | `index_usage.user_seeks + user_scans + user_lookups = 0` (or NULL) and `user_updates` high; exclude PK/unique-constraint indexes | reads = 0 and `user_updates >= 1,000` | Medium (High if `user_updates` very high *and* index is wide) | Consider dropping after validating over a full business cycle | Every index is maintained on every write and consumes buffer pool/backup space; zero-read indexes are pure overhead |
-| **Rarely-used wide index** | reads low relative to `user_updates`; wide `included_column_list` | reads < `user_updates / 100` | Low | Review necessity / trim INCLUDE columns | Low-value index paying high write cost |
-| **Exact-duplicate index** | same `key_column_list` (same order) on same `object_id` | exact match | Medium | Drop the redundant copy (keep the better-covering one) | Duplicates double write cost for zero read benefit |
-| **Left-prefix overlap** | one index's `key_column_list` is a leading prefix of another's | prefix match | Low | Consolidate into the wider/more-general index | The prefix index is redundant for most access |
-| **Disabled index** | `indexes.is_disabled = 1` | any | Low | Decide: rebuild (re-enable) or drop | A disabled index is dead weight in the catalog and may signal abandoned tuning |
+| **Non-unique clustered index** | `indexes` clustered, `is_unique = 0` | any | Medium | Make the clustered key unique (or base it on the PK) | Hidden uniquifier bloats every NCI row locator |
+| **GUID-leading clustered key** | leading key column is `uniqueidentifier` | any | High | Sequential surrogate or `NEWSEQUENTIALID()` | Random inserts → page splits, fragmentation, write amplification |
+| **Wide clustered key** | summed `max_length_bytes` of key columns | `>= 100` bytes | High `>= 200`; else Medium | Narrow the key (surrogate IDENTITY) | Every NCI carries the full clustered key as its locator |
+| **Large heap** | `is_heap` and `row_count >= 500,000` | as stated | Medium | Evaluate a clustered index on the primary access path | Ordered access, no RID lookups/forwarding |
+
+**Caveats.** GUID keys are sometimes mandated by app frameworks — the fix may be `NEWSEQUENTIALID()` or clustering on something else while keeping the GUID as a nonclustered PK. All fixes are size-of-data `[SCHEMA CHANGE]`s. `consult_skill = sqlserver-engineering`.
+
+---
+
+## a03 — Table Design: Data-Type Smells
+
+Reads `columns`, `foreign_keys`.
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **LOB MAX column** | `(n)varchar/varbinary` with `max_length_bytes = -1` | any | Low | Right-size if values are bounded | MAX stores off-row, hurts scans/grants, blocks ONLINE ops |
+| **Deprecated LOB types** | `text` / `ntext` / `image` | any | Medium | Migrate to `(N)VARCHAR(MAX)` / `VARBINARY(MAX)` | Deprecated, feature-hostile, replication/AG friction |
+| **FK type/length mismatch** | parent vs. referenced column type or length differs | any | High | Align FK column type with the referenced key | `CONVERT_IMPLICIT` on the join → non-SARGable lookups |
+| **Row-overflow risk** | summed declared widths `> 8060` bytes | as stated | Medium | Right-size columns / vertical split | Off-row push adds pointer indirection and reads |
+| **Very high nullable ratio** | `>= 80%` nullable of `>= 10` columns | as stated | Low | Review normalization / SPARSE | Mostly-nullable tables often hide multiple entities |
+
+**Caveats.** Data-type changes are size-of-data `[SCHEMA CHANGE]`s and can break application contracts — verify usage first. `consult_skill = sqlserver-engineering`.
+
+---
+
+## a04 — Indexing: Unused & Disabled Indexes
+
+Reads `index_usage`, `indexes`, `server_info` (uptime).
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Written-never-read index** | reads = 0, `user_updates > 0`; excludes PK/unique-constraint/disabled | any writes | **Uptime-aware:** Low if uptime < 7 days; High if `user_updates >= 100,000`; Medium `>= 1,000` | Confirm over a representative window, then consider dropping | Pure write cost, zero read benefit |
+| **Low read:write ratio** | reads < 1% of `user_updates`, `user_updates >= 1,000` | as stated | same scale | Review necessity / trim | Low-value index paying high write cost |
+| **Disabled index** | `indexes.is_disabled = 1` | any | Medium | REBUILD to re-enable, or DROP | Dead metadata weight; disabled clustered = inaccessible table |
 
 **Caveats — read before recommending a drop.**
-- **Usage counters reset on instance restart**, and historically on index rebuild on some versions. A "zero reads" index may simply be young, or feed a **month-end / quarter-end / year-end job** that hasn't run during the capture window. **Confirm over a representative uptime window** (check `server_info.sqlserver_start_time` — short uptime = untrustworthy usage stats) and ideally across multiple captures (trend; see `duckdb-analysis.md`).
-- **Never drop** the index backing a `PRIMARY KEY` / `UNIQUE` constraint (`is_primary_key`/`is_unique_constraint = 1`) or a unique index enforcing integrity, and check it isn't the supporting index for a foreign key's joins/cascades.
-- A left-prefix index can still be the *better* choice if it's narrower and hotter — consolidation isn't automatic.
-- `consult_skill = sqlserver-engineering` (indexing.md §10). Dropping an index is a `[SCHEMA CHANGE]`.
+- **Usage counters reset on instance restart** and are **wiped on database close** (`AUTO_CLOSE` — see the capture guide's volatile-DMV caveat). A "zero reads" index may feed a **month-end job** that hasn't run in the window. The rule already downgrades to Low under 7 days' uptime; confirm across multiple captures before dropping.
+- **Never drop** the index backing a `PRIMARY KEY`/`UNIQUE` constraint (the rule excludes them) and check it isn't supporting FK joins/cascades (cross-reference `a12`).
+- Dropping is a `[SCHEMA CHANGE]`. `consult_skill = sqlserver-engineering`.
 
 ---
 
-## a03 — Indexing: Missing Indexes (consolidated)
+## a05 — Indexing: Duplicate & Overlapping Indexes
 
-Reads `missing_indexes`.
+Reads `indexes`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **High-impact missing index** | rank by `improvement_measure` (= `avg_total_user_cost * avg_user_impact/100 * (user_seeks + user_scans)`) | `improvement_measure >= 50,000` *and* `avg_user_impact >= 70` | High | **Consolidate overlapping suggestions for the same table**, then design one curated covering index (equality cols first in selectivity order, fold the rest into INCLUDE), test, and create | The optimizer wished it had this index during compilation; missing it forces scans/lookups |
-| **Moderate missing index** | same | `improvement_measure` 10,000–50,000 | Medium | Same consolidate-then-curate workflow | Material but lower-priority gap |
-| **Many suggestions, one table** | count of `missing_indexes` rows per `object_id`/table | `>= 5` suggestions on one table | Medium | Triage as a *set* — these are near-duplicates differing by an INCLUDE column | Indicates the table needs an index review, not 5 new indexes |
+| **Exact duplicate** | same `key_column_list` **and** same `included_column_list` on one table | exact match | High | Keep one, drop the redundant copy | Double write/storage cost, zero added capability |
+| **Left-prefix overlap** | one key list is a leading prefix of a wider index's | prefix match | Medium | Consider dropping the narrower (check seek patterns/INCLUDEs first) | The wider index usually satisfies the same seeks |
 
-**Caveats — the DMV suggestions are RAW, not a plan.**
-- Missing-index DMVs **never consolidate** overlapping suggestions, **ignore existing indexes**, **ignore write cost**, and don't always order equality-before-inequality correctly. **Never apply them verbatim.** Merge near-duplicates into one index, check it doesn't duplicate an existing index (cross-reference `indexes`), and weigh the DML overhead the new index adds.
-- `improvement_measure` is a *ranking* heuristic, not absolute truth.
-- Suggestions are also reset on restart and reflect only the workload seen since then.
-- `consult_skill = sqlserver-engineering` (indexing.md §9 — "Use, Don't Obey"). Creating an index is a size-of-data `[SCHEMA CHANGE]`; ONLINE rebuild is Enterprise/Azure-gated.
+**Caveats.** A prefix index can still be the better choice if it's much narrower and hotter — consolidation isn't automatic. Dropping is a `[SCHEMA CHANGE]`. `consult_skill = sqlserver-engineering`.
 
 ---
 
-## a04 — Indexing: Fragmentation & Page Fullness
+## a06 — Indexing: Missing Indexes (top 25, consolidated)
 
-Reads `index_physical` (SAMPLED, already filtered to `page_count >= 1000`).
+Reads `missing_indexes`, `index_usage` (table write context).
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Heavily fragmented large index** | `avg_fragmentation_in_percent` high on a large index | `frag >= 30%` and `page_count >= 1000` | Medium (High if `page_count` very large *and* it's a hot index) | **REBUILD** (consider ONLINE on Enterprise/Azure) | Fragmentation hurts range scans and read-ahead; only matters on disk-bound scans |
-| **Moderately fragmented index** | as above | `frag` 10–30% and `page_count >= 1000` | Low | **REORGANIZE** (online, any edition) | Light fragmentation → cheaper reorganize, not a rebuild |
-| **Low page density** | `avg_page_space_used_in_percent` low | `< 70%` and `page_count >= 1000` | Low | Review fill factor; rebuild to re-pack | Half-empty pages waste buffer pool and inflate I/O |
-| **Forwarded records (heap)** | `forwarded_record_count` high (`index_id = 0`) | `>= 1,000` | Medium | Add a clustered index, or `ALTER TABLE ... REBUILD` the heap | Forwarded records cause extra random reads on every scan |
+| **High-impact suggestion** | rank by `improvement_measure` (= `avg_total_user_cost * avg_user_impact/100 * (user_seeks + user_scans)`), top 25 | High `>= 100,000`; Medium `>= 10,000`; else Low | as stated | Consolidate near-duplicates, order keys equality-then-range, cover with INCLUDE, check overlap with existing indexes, then create | The optimizer wished for this index at compile time |
+| **Write-heavy table flag** | table's summed `user_updates >= 100,000` | as stated | annotation on the finding | "Consolidate, do not just add" | New index cost lands on every one of those writes |
 
-**Caveats.**
-- The classic 5%/30% reorganize/rebuild guidance is a **starting heuristic, widely over-applied**. Fragmentation **only matters for large range scans on disk-bound workloads**; on SSD/NVMe or when the index lives in the buffer pool, it's often irrelevant. **Don't rebuild on a schedule just to hit a number** — and over-aggressive rebuilds churn the transaction log, bloat differential backups, and reset usage stats. Rebuild because a *scan-heavy workload* is slow, not because a percentage crossed a line.
-- ONLINE rebuild is **Enterprise/Developer/Eval and Azure SQL DB/MI only**; on Standard, `REBUILD` is OFFLINE (Sch-M lock blocks the table) — default to REORGANIZE or a maintenance window.
-- The capture is SAMPLED (LIMITED-equivalent), so `avg_fragmentation_in_percent` is approximate.
-- **Maintenance is owned by operations** — `consult_skill = sqlserver-operations`. The *index design* implications (fill factor, key choice) are in `sqlserver-engineering`. Rebuild/reorganize are `[SCHEMA CHANGE]` operations.
+**Caveats — the DMV suggestions are RAW, not a plan.** They never consolidate, ignore existing indexes, ignore write cost, and don't reliably order equality-before-inequality. **Never apply verbatim.** They also reset on restart/DB close. `consult_skill = sqlserver-engineering` (indexing — "Use, Don't Obey"). Creating an index is a size-of-data `[SCHEMA CHANGE]`.
 
 ---
 
-## a05 — Sizing & Capacity
+## a07 — Indexing: Fragmentation
 
-Reads `tables`, `db_inventory`.
+Reads `index_physical` (SAMPLED, `page_count >= 1000`).
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Very large uncompressed table** | `tables.total_space_mb` large and `data_compression_desc IN ('NONE', NULL)` | `total_space_mb >= 102,400` (100 GB) | Medium | Evaluate `ROW`/`PAGE` compression (or columnstore for analytic tables) in non-prod | Compression cuts I/O and buffer-pool footprint at a CPU cost |
-| **High unused space** | `tables.unused_space_mb` large relative to `total_space_mb` | `unused_space_mb >= 1,024` and `>= 25%` of total | Low | Investigate (dropped LOB, over-allocation, fragmentation, ghost records) | Allocated-but-unused space wastes storage and backups |
-| **Large DB on FULL recovery, log-reuse blocked** | `db_inventory.recovery_model_desc = 'FULL'` and `log_reuse_wait_desc` not `NOTHING`/`CHECKPOINT` | `log_reuse_wait_desc IN ('LOG_BACKUP','ACTIVE_TRANSACTION','AVAILABILITY_REPLICA',...)` | Medium (High if `LOG_BACKUP` and DB is large) | Confirm log backups are running (or the AG/transaction issue) | A blocked log can grow unbounded and stop the database |
-| **Capacity trend (multi-capture)** | growth in `total_size_mb` / `total_space_mb` across runs | `pct_growth` per interval above your norm | Medium | Plan storage; revisit data-lifecycle/archival/partitioning | Forecast before you run out of disk |
+| **High fragmentation** | `avg_fragmentation_in_percent > 30` | as stated | High if `page_count >= 100,000`; else Medium | REBUILD (ONLINE only on Enterprise/Azure) | Restores contiguity + fill factor |
+| **Moderate fragmentation** | 10–30% | as stated | Low | REORGANIZE (always online) | Cheap leaf-level defrag |
 
-**Caveats.**
-- **Compression has real CPU cost** — `PAGE` more than `ROW`. It's a win on I/O-bound, scan-heavy, or buffer-pressured systems; it can hurt CPU-bound OLTP. Always measure in non-prod with a representative workload; compressing is a size-of-data `[SCHEMA CHANGE]`.
-- Unused space has many benign causes (recent large delete, LOB allocation); investigate before reclaiming. `DBCC SHRINK*` is **not** a routine fix — it causes massive fragmentation and is a `[DATA-LOSS RISK]`-adjacent operation owned by operations.
-- Trend rules require multiple captures (see `duckdb-analysis.md` §6); a single snapshot can't show growth.
-- `consult_skill = sqlserver-operations` (capacity, backup, maintenance); compression *design* and columnstore → `sqlserver-engineering`.
+**Caveats.** The 10/30 guidance is a **starting heuristic, widely over-applied** — fragmentation mostly matters for large range scans on disk-bound workloads; on SSD/NVMe or a warm buffer pool it's often irrelevant. Don't rebuild to chase a number; rebuilds churn the log and bloat differentials. ONLINE rebuild is Enterprise/Developer/Azure-gated; Standard rebuilds are OFFLINE (Sch-M). Maintenance is owned by `sqlserver-operations`; the metric includes `avg_page_space_used_in_percent` (page fullness) as supporting evidence.
 
 ---
 
-## a06 — Statistics
+## a08 — Sizing & Capacity
 
-Reads `db_inventory` (auto-stats flags), `tables` (size context). *(Per-statistic freshness — last-updated, rows-sampled — is not in the contract; this rule works at the database-setting level and flags where deeper, live inspection is warranted.)*
+Reads `tables`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Auto-create stats off** | `db_inventory.is_auto_create_stats_on = 0` | off | High | Enable `AUTO_CREATE_STATISTICS` unless a deliberate, documented exception | Without it the optimizer flies blind on un-indexed predicates → bad plans |
-| **Auto-update stats off** | `db_inventory.is_auto_update_stats_on = 0` | off | High | Enable `AUTO_UPDATE_STATISTICS` (or prove a managed stats job covers every table) | Stale stats → bad cardinality → bad plans |
-| **Async update off on a busy DB** | `is_auto_update_stats_async_on = 0` on a large/hot DB | off and large DB | Low | Consider `AUTO_UPDATE_STATISTICS_ASYNC ON` to avoid compile-time stalls | Sync updates can block the query that triggered them |
-| **Large DB likely to suffer stale stats** | big tables in `tables` + manual stats expectations | very large tables present | Low (informational) | Verify a stats-maintenance strategy exists; inspect freshness live | Big tables update stats less often relative to row churn (sublinear threshold) |
+| **Largest tables (top 20)** | rank by `total_space_mb` | top 20 | High `>= 50 GB`; Medium `>= 10 GB`; else Low | Trend growth across captures; review retention/archival | Largest tables drive backup duration, RTO, maintenance windows |
+| **High unused space** | `unused_space_mb >= 1,024` and `> 20%` of total | as stated | High `>= 10 GB` | Investigate cause; REBUILD reclaims most; avoid routine shrinks | Allocated-but-unused pages still get stored/backed up/scanned |
+| **Large uncompressed table** | `data_compression_desc = 'NONE'`, `total >= 1 GB` | as stated | Medium `>= 10 GB`; else Low | Evaluate ROW/PAGE compression (columnstore for analytics) | Cuts I/O and buffer-pool footprint at CPU cost |
+| **Very large unpartitioned table** | `total >= 50 GB`, `partition_count <= 1` | as stated | Medium | Evaluate partitioning for lifecycle management (not speed) | SWITCH/piecemeal maintenance on huge tables |
+| **Over-indexed table** | `index_space > 2x data_space`, data `>= 100 MB` | as stated | Medium `>= 10 GB` index | Cross-check `a04`/`a05`, consolidate | Indexes outweighing data usually means redundant indexes |
 
-**Caveats.**
-- **Turning auto-create/auto-update *off* is occasionally deliberate** (e.g. a controlled stats job, or avoiding mid-day auto-update stalls on a huge table). Flag it, don't assume it's a mistake — confirm whether a managed job compensates.
-- Per-statistic staleness (histogram age, `rows_sampled` vs `rows`, ascending-key problem) needs a **live** look — point the user to `sqlserver-engineering`'s `scripts/06-statistics-info.sql`. This capture intentionally carries only the database-level switches.
-- Enabling/disabling auto-stats is a `[CONFIG CHANGE]` (`ALTER DATABASE ... SET ...`). `consult_skill = sqlserver-engineering` (query-optimization.md — statistics & the CE).
+**Caveats.** Compression has real CPU cost (`PAGE` > `ROW`) — measure in non-prod; it's a size-of-data `[SCHEMA CHANGE]`. Unused space has benign causes (recent delete, LOB); `DBCC SHRINK*` is **not** a routine fix. Growth *trends* need multiple captures (`duckdb-analysis.md` §6). `consult_skill = sqlserver-operations`; compression/partition design → `sqlserver-engineering`.
 
 ---
 
-## a07 — Query Hotspots
+## a09 — Query Hotspots
 
 Reads `query_stats` (top ~50 plan-cache queries).
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Top CPU consumer (aggregate)** | high `total_worker_time_ms` | top by total worker time | High for the top few | Tune the query/index; inspect the plan live | These dominate instance CPU — the biggest aggregate wins |
-| **Expensive per execution** | high `avg_worker_time_ms` or `avg_elapsed_time_ms` | `avg_worker_time_ms >= 1,000` | Medium | Inspect the plan; check SARGability, missing index, sniffing | Individually slow even if infrequent |
-| **High logical reads (I/O hog)** | high `total_logical_reads` / `avg_logical_reads` | `avg_logical_reads >= 100,000` | Medium–High | Add covering index / fix scan; correlate with `a03` | Read amplification → buffer pressure and I/O waits |
-| **Large memory grant** | high `total_grant_kb` relative to `execution_count` | grant per exec very large | Medium | Check for spills/over-grant; fix cardinality estimate | Over-grants throttle concurrency (`RESOURCE_SEMAPHORE`) |
-| **Frequent + cheap-each but heavy total** | very high `execution_count`, modest avg | total cost high via frequency | Medium | Reduce call frequency / batch / cache; or shave per-call cost | Death-by-a-thousand-cuts hotspots |
+| **Top CPU consumers** | rank by `total_worker_time_ms`, top 15 | top 3 High; top 8 Medium; else Low | as stated | Capture the actual plan; SARGability, estimates, missing indexes | Biggest aggregate CPU wins |
+| **Top logical-read (I/O) queries** | rank by `total_logical_reads`, top 15 | same scale | as stated | Scans that should be seeks; covering indexes (cross-ref `a06`) | Read amplification → buffer churn, I/O waits |
+| **Expensive AND frequent** | `avg_elapsed >= 100 ms` and `execs >= 1,000` | as stated | High | Prioritize: per-call cost × frequency; check for RBAR | Cost×frequency is the true workload burden |
 
-**Caveats.**
-- `query_stats` comes from the **plan cache, which is volatile** — it clears on restart, memory pressure, and recompiles, so it reflects only recently-cached plans and undercounts `OPTION (RECOMPILE)` and one-off ad-hoc queries. It is **not** historical truth — for "what changed yesterday," use **Query Store** (live; see `sqlserver-monitoring`).
-- `sample_query_text` is one representative statement for a `query_hash`; parameter values and the actual plan are not in the capture. Inspect the live plan before tuning.
-- `total_*_ms` figures are derived from microsecond DMV columns; treat as indicative, not exact.
-- Fixing a query (index, plan, sniffing) → `consult_skill = sqlserver-engineering`. Finding *why it's slow right now* (live waits/plan) → `sqlserver-monitoring`.
+**Caveats.** The plan cache is **volatile** — clears on restart/memory pressure/recompile; undercounts `OPTION (RECOMPILE)` and one-off ad-hoc queries. Not historical truth — for "what changed yesterday" use **Query Store** (`sqlserver-monitoring`). `sample_query_text` is one representative statement per hash; inspect the live plan before tuning. `consult_skill = sqlserver-engineering` (fix) / `sqlserver-monitoring` (find).
 
 ---
 
-## a08 — Configuration
+## a10 — Configuration (instance sp_configure)
 
-Reads `config`, `server_info`, `db_inventory`.
+Reads `config`, `server_info`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Cost threshold for parallelism at default 5** | `config.config_name = 'cost threshold for parallelism'`, `value_in_use = 5` | `= 5` | Medium | Raise (commonly start ~50) and observe | The 1997-era default sends trivial queries parallel → `CXPACKET` |
-| **MAXDOP misconfigured** | `config 'max degree of parallelism'` vs `server_info.host_cpu_count` | `= 0` on a many-core box, or > NUMA-node core count | Medium | Set per current guidance for core/NUMA layout | MAXDOP 0 on a big box → runaway parallelism |
-| **`max server memory` left at default** | `config 'max server memory (MB)'` near the 2147483647 default | at/near default and box product | High | Cap it below physical RAM, leaving headroom for OS/other | Uncapped SQL Server starves the OS → paging, instability |
-| **`optimize for ad hoc workloads` off** | `config 'optimize for ad hoc workloads' = 0` | off | Low | Enable to curb single-use plan-cache bloat | Reduces cache pollution from one-off queries |
-| **Legacy / risky settings** | e.g. `priority boost = 1`, `lightweight pooling = 1`, non-default `affinity` | any set | Medium | Review — these are almost always wrong | Known-harmful legacy knobs |
-| **RCSI off on OLTP DB** | `db_inventory.is_read_committed_snapshot_on = 0` | off on an OLTP DB | Low–Medium | Evaluate enabling RCSI for non-blocking consistent reads | Removes reader/writer blocking without `NOLOCK` hazards |
-| **Old compatibility level** | `db_inventory.compatibility_level` well below engine major | e.g. compat 100/110 on a 2019+ engine | Low | Plan a compat-level uplift with Query Store regression testing | Locks the DB out of modern optimizer/IQP features |
-| **Non-`CHECKSUM` page verify** | `db_inventory.page_verify_option_desc <> 'CHECKSUM'` | `NONE`/`TORN_PAGE_DETECTION` | Medium | Set `PAGE_VERIFY CHECKSUM` | Without CHECKSUM, on-disk corruption can go undetected |
+| **Cost threshold for parallelism = 5** | `value_in_use = 5` | default | Medium | Raise (commonly 25–50), tune with CXPACKET/CXCONSUMER | 1990s default sends trivial queries parallel |
+| **MAXDOP = 0 on multi-core** | `value = 0`, `host_cpu_count > 1` | as stated | High `>= 16` cores; else Medium | Bound per core/NUMA layout (typically ≤ 8) | One query can consume every scheduler |
+| **Optimize for ad hoc off** | `value = 0` | off | Low | Enable | Single-use plans bloat the cache |
+| **Backup compression default off** | `value = 0` | off | Low | Enable (box; check platform) | Smaller, faster backups at modest CPU |
+| **max server memory uncapped** | `value >= 2147483647` on box (`engine_edition NOT IN (5,6,8)`) | default | High | Cap below physical RAM with OS headroom | Uncapped buffer pool starves the OS into paging |
+| **Legacy knobs enabled** | `priority boost = 1` or `lightweight pooling = 1` | any | Medium | Turn off in a window | Long-deprecated, known-harmful settings |
 
-**Caveats.**
-- **Configuration is platform-specific.** On **Azure SQL Database** you don't set instance memory or MAXDOP the box way (database-scoped settings differ); on **Azure SQL MI / RDS / Cloud SQL** some knobs are managed. Read `server_info.engine_edition` and qualify the finding.
-- "Best practice" defaults are **starting points**, not laws — MAXDOP/cost-threshold/memory depend on workload and hardware. Recommend, then *observe* (correlate with `a09` waits).
-- Changing compat level or RCSI changes plan shapes / read semantics **database-wide** — capture a Query Store baseline and test; RCSI needs brief exclusive DB access and shifts load to the tempdb version store.
-- All of these are `[CONFIG CHANGE]`s. `consult_skill = sqlserver-infrastructure` (instance/memory/MAXDOP/tempdb/trace flags); RCSI/compat-level *design* and isolation semantics → `sqlserver-engineering`.
+**Caveats.** Configuration is **platform-specific** — on Azure SQL DB these are platform-managed (rules mostly cannot fire because `config` is empty/irrelevant there); on MI/RDS/Cloud SQL several knobs are provider-set. Defaults-vs-best-practice are starting points: recommend, then *observe* (correlate with `a17` waits). All `[CONFIG CHANGE]`s. `consult_skill = sqlserver-infrastructure`.
 
 ---
 
-## a09 — Configuration / Waits Context
+## a11 — Database Settings (statistics switches & DB config hygiene)
 
-Reads `wait_stats`, `server_info`.
+Reads `db_inventory` (user DBs only, `database_id > 4`).
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
-|---|---|---|---|---|---|
-| **Dominant wait type** | top `wait_type` by `pct_of_total` | any wait `>= 25%` of total | Medium | Route to the matching subsystem (see table) and confirm live | Points at the bottleneck *class* before you tune anything |
-| **High signal-wait ratio** | `SUM(signal_wait_time_ms) / SUM(wait_time_ms)` | `>= 25%` | Medium | CPU pressure — review MAXDOP/cost threshold and top CPU queries (`a07`) | High signal % = threads ready but waiting for a scheduler |
-| **tempdb allocation contention** | `PAGELATCH_*` prominent (`2:1:n`) | in top waits | Medium | Review tempdb file count/sizing | Allocation-page contention on tempdb |
-| **Memory-grant pressure** | `RESOURCE_SEMAPHORE` prominent | in top waits | Medium | Hunt over-granting queries (`a07` grant rule); review max memory | Queries queuing for memory grants |
-| **Short-uptime warning** | `server_info.sqlserver_start_time` recent | uptime < ~1 day | Informational on every wait/usage finding | Treat wait & usage stats as unreliable until uptime is representative | Cumulative DMVs reset on restart |
+| Rule | Detection | Severity | Recommendation | Why |
+|---|---|---|---|---|
+| **Auto-update stats off** | `is_auto_update_stats_on = 0` | Medium | Enable unless a managed stats regime demonstrably covers it | Stale cardinality → bad plans |
+| **Auto-create stats off** | `is_auto_create_stats_on = 0` | Medium | Enable | Un-stat'd predicates get guessed selectivity |
+| **Sync auto-update on a big DB** | async off and `total_size_mb >= 10 GB` | Low | Consider `AUTO_UPDATE_STATISTICS_ASYNC` | Sync update stalls the triggering query |
+| **PAGE_VERIFY ≠ CHECKSUM** | as stated | Medium | Set CHECKSUM; pair with DBCC CHECKDB | Cheapest early corruption warning |
+| **RCSI off** | `is_read_committed_snapshot_on = 0` | Low | Evaluate for read-heavy OLTP (size tempdb version store) | Removes reader/writer blocking without NOLOCK hazards |
+| **Old compatibility level** | `compatibility_level < 150` | Low | Uplift behind Query Store baseline | Locks out modern optimizer/IQP; can shift plans |
 
-**Wait → subsystem routing (abbreviated; full table in `sqlserver-monitoring`):** `CXPACKET`/`CXCONSUMER` → cost threshold/MAXDOP (infra); `PAGEIOLATCH_*` → I/O / memory / missing index (monitoring + engineering); `WRITELOG` → log disk (infra/ops); `LCK_*` → blocking (monitoring); `RESOURCE_SEMAPHORE` → memory grants (engineering/infra); `ASYNC_NETWORK_IO` → client-side, not the server.
-
-**Caveats.**
-- `wait_stats` is **cumulative since restart** — a one-shot capture is a since-startup average, not a window. It tells you the *dominant class*, not what's happening *right now*. For a true window or live view, use the snapshot-and-diff / per-session waits in **`sqlserver-monitoring`**.
-- Don't chase `CXPACKET` as a disease — it's a symptom (usually low cost threshold).
-- `PAGELATCH_*` (in-memory latch) is **not** `PAGEIOLATCH_*` (disk I/O) — different subsystems.
-- `consult_skill = sqlserver-monitoring` for the live drill-down; the config *fix* routes to `sqlserver-infrastructure`.
+**Caveats.** Auto-stats *off* is occasionally deliberate (controlled jobs) — flag, don't assume. RCSI/compat changes shift behavior database-wide — baseline + staged testing. All `[CONFIG CHANGE]`s. `consult_skill = sqlserver-operations` (stats/page-verify) / `sqlserver-engineering` (RCSI/compat semantics). Per-statistic freshness now has its own capture and rules — see **`a15`**.
 
 ---
 
-## a10 — Table Design: Foreign Keys & Referential Integrity
+## a12 — Table Design: Foreign-Key Trust & Support
 
 Reads `foreign_keys`, `tables`, `indexes`.
 
-| Rule | Detection (key columns) | Default threshold | Severity | Recommendation | Why |
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
 |---|---|---|---|---|---|
-| **Untrusted foreign key** | `foreign_keys.is_not_trusted = 1` (and not disabled) | any | Medium | `WITH CHECK CHECK CONSTRAINT` to re-validate | An untrusted FK can't be used by the optimizer for join elimination/cardinality and may hide integrity violations |
-| **Disabled foreign key** | `foreign_keys.is_disabled = 1` | any | Medium (High if a large child table) | Decide: re-enable (with check) or document the exception | A disabled FK enforces nothing — orphan rows can accumulate |
-| **Unindexed FK column** | FK `parent_column_list` not matched by a leading index key in `indexes` | no supporting index | Low–Medium | Add an index on the FK column(s) | Unindexed FKs cause scans on joins and slow/escalating-lock cascading deletes |
-| **Cascading actions on large tables** | `delete/update_referential_action_desc <> 'NO_ACTION'` on big child tables | `CASCADE`/`SET NULL`/`SET DEFAULT` on a large table | Low | Review the blast radius of cascades | Cascades can fan out into large, lock-heavy modifications |
+| **Untrusted FK** | `is_not_trusted = 1` and not disabled | any | High if child `>= 1M` rows; else Medium | `WITH CHECK CHECK CONSTRAINT` to re-validate (size-of-data scan — schedule) | Optimizer can't use it; violations may already exist |
+| **Disabled FK** | `is_disabled = 1` | any | High if child `>= 1M` rows; else Medium | Re-enable WITH CHECK, or drop and document | Enforces nothing; orphans accumulate |
+| **Cascade on large child** | referential action ≠ `NO_ACTION`, child `>= 1M` rows | as stated | Low | Review blast radius; consider batched cleanup | One parent DELETE fans out lock/log-heavy |
+| **Unindexed FK column** | no index leads on the FK's first column | any enabled FK | Medium if child `>= 100k` rows; else Low | Index the FK column(s) **if** joined/filtered or parent sees deletes | Child scans on referential checks and joins |
 
-**Caveats.**
-- Re-validating an untrusted FK (`WITH CHECK`) **scans the child table** to verify every row — a size-of-data operation; schedule it. It's a `[SCHEMA CHANGE]`.
-- An "unindexed FK" is only worth indexing if the FK column is actually joined/filtered or the parent sees deletes/updates — don't add indexes reflexively (see `a02` over-indexing).
-- FKs may be intentionally `NOCHECK` during bulk loads/migrations — confirm it's not transient.
-- `consult_skill = sqlserver-engineering` (schema-design.md — constraints & trusted constraints; indexing.md for the supporting index).
+**Caveats.** NOCHECK may be transient (bulk load/migration in progress) — confirm before flagging loudly. Re-validation scans the child table. An unindexed FK only matters if the access pattern exercises it — don't add indexes reflexively (see `a08` over-indexing). `[SCHEMA CHANGE]`s. `consult_skill = sqlserver-engineering`.
+
+---
+
+## a13 — Configuration / Sizing: Files, Autogrowth, VLFs, tempdb
+
+Reads `db_files`, `server_info`.
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Percent autogrowth** | `is_percent_growth = 1` | any | Medium | Fixed-MB increments (commonly 256–1024 MB); pre-size | Compounding growth events; log growth zero-fills synchronously |
+| **Tiny fixed growth** | growth `< 64 MB` on a file `>= 1 GB` | as stated | Medium | Raise increment; enable instant file init (data) | Constant micro-growth events; tiny VLFs on logs |
+| **Autogrowth disabled** | `growth_value = 0` | any | Medium | Confirm deliberate, else enable a safety-net growth | File hard-stops when full |
+| **Near MAXSIZE cap** | `size >= 80%` of `max_size_mb` (and growth enabled) | as stated | High `>= 95%`; else Medium | Raise/remove the cap or purge/archive | 1105/9002 errors at the cap |
+| **High VLF count** | `vlf_count >= 300` (log files, 2016 SP2+) | as stated | High `>= 1,000` | One-time shrink + re-grow in large increments | Tiny-VLF bloat slows recovery/restores/log ops |
+| **tempdb file count** | data files < `min(8, cpu_count)` on multi-core | as stated | High if exactly 1 file | One file per CPU up to 8, equal size/growth | PFS/GAM/SGAM allocation contention |
+
+**Caveats.** On Azure SQL DB this capture is skipped (platform-managed). On RDS/Cloud SQL tempdb layout is provider-managed — informational. The VLF "shrink then re-grow" is the **one legitimate shrink**; routine shrinks remain harmful. tempdb changes need a service restart to take full effect. `[CONFIG CHANGE]`s. `consult_skill = sqlserver-infrastructure` (growth/tempdb) / `sqlserver-operations` (capacity/VLF).
+
+---
+
+## a14 — Configuration: Backup & Recovery Cadence
+
+Reads `backup_history`, `db_inventory`.
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Never backed up** | `last_full_backup IS NULL` | any | High (user DB); Medium (system DB) | Take a full now; schedule to RPO | No restore path at all |
+| **Stale full** | last full `> 7 days` ago | as stated | High `> 30 days`; else Medium | Restore-test + fix cadence; check for silently-dead jobs | Widening restore gap |
+| **FULL recovery, no log backups** | FULL/BULK_LOGGED and last log backup NULL or `> 24 h` | as stated | High | Schedule log backups (5–15 min typical) or deliberately go SIMPLE | Log grows unbounded; PITR is fiction without log backups |
+| **Log reuse blocked** | `log_reuse_wait_desc` not `NOTHING`/`CHECKPOINT` | any | High if `LOG_BACKUP`; else Medium | Fix the blocker (log backups / long transaction / AG replica / replication) | Blocked log → disk-full → error 9002 write outage |
+| **SIMPLE on a sizable DB** | SIMPLE and `>= 10 GB` | as stated | Low | Confirm the RPO is accepted | No point-in-time restore |
+| **Full without CHECKSUM** | `last_full_has_checksum = 0` | as stated | Low | `WITH CHECKSUM` + periodic restore tests | Backups can preserve corruption silently |
+
+**Caveats.** COPY_ONLY fulls are excluded from the "recent full" logic (they don't establish the chain). **Managed platforms:** Azure SQL DB/MI automatic backups and RDS/Cloud SQL snapshots do **not** appear in msdb — the collector is skipped (Azure SQL DB) or its findings are informational unless native backups are the DR strategy. A backup is only proven by a **restore test**. `consult_skill = sqlserver-operations`.
+
+---
+
+## a15 — Statistics: Per-Statistic Staleness
+
+Reads `stats_health` (statistics on rowsets ≥ 1000 rows).
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Stale stats** | `modification_counter >= max(500, sqrt(1000 × rows))` (the engine's own compat-130+ threshold) | as stated | High if `rows >= 1M` and mods `>= 20%` of rows; else Medium | UPDATE STATISTICS; find out why auto-update didn't fire | Histogram drift → cardinality misestimates → bad plans |
+| **Old stats with churn** | `last_updated > 90 days` ago, mods > 0 (below rule-1 threshold) | as stated | Low | Fold into scheduled stats maintenance | Slow-churn tables age below the auto threshold for months |
+| **Poor sampling** | `rows >= 1M` and `sample_pct < 5%` | as stated | Low | FULLSCAN / persisted sample rate if plans misestimate | Tiny samples miss skew |
+| **NORECOMPUTE** | `no_recompute = 1` | any | Medium | Confirm a manual regime covers it, else re-enable | Frozen out of auto-update = silent decay |
+
+**Caveats.** `modification_counter` counts **leading-column** changes since the last update — churn concentrated in non-leading columns undercounts. INCREMENTAL stats are absent from this capture (different TVF). Stats update triggers plan recompiles — schedule heavy passes in a window. `[INDEX MAINTENANCE]`. `consult_skill = sqlserver-operations` (maintenance) / `sqlserver-engineering` (CE behavior, ascending-key problem).
+
+---
+
+## a16 — Table Design: Identity & Sequence Exhaustion
+
+Reads `identity_columns`.
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Range consumption** | `pct_used = last_value / type max` (ascending, non-cycling only) | `>= 50%` reported | High `>= 90%`; Medium `>= 70%`; else Low | Widen the type (int → bigint; size-of-data rebuild — plan it) or reseed into the negative range as a stopgap | At the max, every INSERT fails with error 8115 — a total, predictable write outage |
+
+**Caveats.** Burn *rate* matters more than the current percentage — trend `last_value` across captures to compute the exhaustion date. A negative reseed doubles the runway but breaks apps assuming positive IDs. Widening an int PK also widens every FK and index that carries it — a project, not a hotfix; start it at 70%, not 95%. `[SCHEMA CHANGE]`. `consult_skill = sqlserver-engineering`.
+
+---
+
+## a17 — Configuration: Waits Context
+
+Reads `wait_stats` (benign-filtered by the collector), `server_info` (uptime).
+
+| Rule | Detection | Default threshold | Severity | Recommendation | Why |
+|---|---|---|---|---|---|
+| **Dominant wait type** | `pct_of_total >= 25%` | as stated | High `>= 50%`; else Medium | Routed per class (table below) | Names the bottleneck *class* to investigate first |
+| **High signal-wait ratio** | `SUM(signal) / SUM(wait) >= 25%` | as stated | Medium | Reduce CPU demand (top queries `a09`, parallelism `a10`) before adding CPUs | Runnable-but-waiting = scheduler (CPU) pressure |
+
+**Wait → subsystem routing (built into the rule):** `CXPACKET`/`CXCONSUMER` → cost threshold/MAXDOP (`sqlserver-infrastructure`); `PAGEIOLATCH_*` → memory/indexes/storage; `WRITELOG` → log-disk latency + VLFs (`a13`); `LCK_*` → blocking (live, `sqlserver-monitoring`); `RESOURCE_SEMAPHORE` → memory grants (`sqlserver-engineering`); `PAGELATCH_*` → tempdb allocation (`a13`); `ASYNC_NETWORK_IO` → the client, not the server; `HADR_*` → AG sync (`sqlserver-ha-clustering`).
+
+**Caveats.** Counters are **cumulative since restart** — a one-shot capture is a since-startup average, not a window; the finding carries uptime so you can judge it. Short uptime = unreliable. Don't chase `CXPACKET` as a disease. `PAGELATCH_*` (memory latch) ≠ `PAGEIOLATCH_*` (disk I/O). For a true live window use the snapshot-and-diff views in **`sqlserver-monitoring`**.
 
 ---
 
 ## How a99 Prioritizes
 
-`a99` `UNION ALL`s all rule outputs and orders **High → Medium → Low**, then by dimension and object. The intent is a single, skimmable, *explained* worklist: each row says what's wrong, what to do, why, the evidence, and where to go for depth. Read it top-down, but always apply the universal caveats:
+`a99` materializes every rule above into one `advisor_findings` view (each rule's logic appears exactly once — the individual `aNN` files and `a99` are kept in sync verbatim) and orders **High → Medium → Low**, then by dimension and object; a second result gives counts by dimension × severity from the same view. Read it top-down, but always apply the universal caveats:
 
 1. **Advisory only** — a snapshot can't see intent, schedules, or SLAs. **Validate in non-prod.**
-2. **Watch uptime** — short `sqlserver_start_time` makes usage/wait/missing-index stats unreliable (they reset on restart).
+2. **Watch uptime** — short `sqlserver_start_time` makes usage/wait/missing-index stats unreliable (they reset on restart, and on database close under `AUTO_CLOSE`).
 3. **Consolidate, don't obey** — missing-index suggestions are raw; merge and curate.
-4. **Mind the cost of the fix** — compression/rebuilds cost CPU and log; new indexes cost writes; partitioning is *not* a performance feature by itself.
-5. **Confirm platform/edition** — feature gates and managed-platform restrictions change the recommendation.
+4. **Mind the cost of the fix** — compression/rebuilds cost CPU and log; new indexes cost writes; partitioning is *not* a performance feature by itself; type-widening is a project.
+5. **Confirm platform/edition** — feature gates and managed-platform restrictions change the recommendation (and silence some captures entirely).
 6. **Remediation belongs to the deeper skills** and follows the change-class convention (`[SCHEMA CHANGE]` / `[CONFIG CHANGE]` / `[DATA-LOSS RISK]`). This skill never runs a change.
 
 ---
@@ -221,4 +283,4 @@ Reads `foreign_keys`, `tables`, `indexes`.
 
 - **Running the rules / loading data / trending / adding new rules** → `duckdb-analysis.md`.
 - **What each dimension means and what "good" looks like** → `analysis-dimensions.md`.
-- **Remediation depth:** `sqlserver-engineering` (design/indexing/plans/statistics) · `sqlserver-operations` (maintenance/sizing/backup/DBCC) · `sqlserver-infrastructure` (config/tempdb/memory/MAXDOP/trace flags) · `sqlserver-monitoring` (live waits/Query Store/blocking + community tools).
+- **Remediation depth:** `sqlserver-engineering` (design/indexing/plans/statistics) · `sqlserver-operations` (maintenance/sizing/backup/DBCC) · `sqlserver-infrastructure` (config/tempdb/memory/MAXDOP/trace flags) · `sqlserver-monitoring` (live waits/Query Store/blocking + community tools) · `sqlserver-ha-clustering` (AG sync waits).

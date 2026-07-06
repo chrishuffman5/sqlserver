@@ -5,7 +5,9 @@
 --   (1) 'cost threshold for parallelism' = 5 (default, too low);
 --   (2) 'max degree of parallelism' = 0 on a multi-core host;
 --   (3) 'optimize for ad hoc workloads' = 0 (plan-cache bloat risk);
---   (4) 'backup compression default' = 0 (larger/slower backups).
+--   (4) 'backup compression default' = 0 (larger/slower backups);
+--   (5) 'max server memory (MB)' left at the uncapped default (box only);
+--   (6) legacy/harmful knobs enabled: 'priority boost', 'lightweight pooling'.
 -- All object_name = '(instance)'. Depth: sqlserver-infrastructure.
 -- NOTE: config defaults/best values are workload- and platform-dependent;
 --   on Azure SQL DB many server-level settings are not user-configurable.
@@ -79,4 +81,47 @@ SELECT
 FROM config c
 WHERE c.config_name = 'backup compression default'
   AND c.value_in_use = 0
+
+UNION ALL
+
+-- (5) max server memory left at the uncapped default (2147483647 MB) on a box
+--     product — SQL Server will grow into all physical RAM and starve the OS.
+--     Skipped on managed platforms (engine_edition 5/6/8) where memory is
+--     platform-governed.
+SELECT
+    'Configuration'                                         AS dimension,
+    NULL                                                    AS database_name,
+    '(instance)'                                            AS object_name,
+    'High'                                                  AS severity,
+    'max server memory (MB) = ' || c.value_in_use
+        || ' (uncapped default); host_physical_memory_mb = '
+        || COALESCE(s.host_physical_memory_mb, 0)           AS metric,
+    'max server memory is at the uncapped default.'         AS finding,
+    'Cap it below physical RAM, leaving headroom for the OS and anything else on the host (a common starting point: total RAM minus 4 GB minus 1 GB per 8 GB of RAM; then observe). [CONFIG CHANGE]' AS recommendation,
+    'Uncapped, the buffer pool grows until Windows/Linux is starved into paging — the whole box (including SQL Server itself) gets slower and less stable.' AS why,
+    'sqlserver-infrastructure'                              AS consult_skill
+FROM config c
+CROSS JOIN server_info s
+WHERE c.config_name = 'max server memory (MB)'
+  AND c.value_in_use >= 2147483647
+  AND s.engine_edition NOT IN (5, 6, 8)
+
+UNION ALL
+
+-- (6) Legacy / known-harmful knobs enabled.
+SELECT
+    'Configuration'                                         AS dimension,
+    NULL                                                    AS database_name,
+    '(instance)'                                            AS object_name,
+    'Medium'                                                AS severity,
+    c.config_name || ' = ' || c.value_in_use                AS metric,
+    'Legacy setting ''' || c.config_name || ''' is enabled.' AS finding,
+    'Turn it off (value 0) in a maintenance window — both knobs are long-deprecated and are known to cause more harm than good on modern systems. [CONFIG CHANGE]' AS recommendation,
+    CASE c.config_name
+         WHEN 'priority boost' THEN 'Priority boost elevates SQL Server threads above OS processes and can starve networking/kernel work, causing cluster failovers and stalls; Microsoft has deprecated it for years.'
+         ELSE 'Lightweight pooling (fiber mode) breaks CLR and several components for a workload class that essentially no longer exists; it is a legacy trap.' END  AS why,
+    'sqlserver-infrastructure'                              AS consult_skill
+FROM config c
+WHERE c.config_name IN ('priority boost', 'lightweight pooling')
+  AND c.value_in_use = 1
 ;

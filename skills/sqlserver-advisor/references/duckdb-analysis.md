@@ -2,7 +2,7 @@
 
 How this skill uses **DuckDB** as a local, offline analytics engine to turn a one-time, read-only capture from a target SQL Server into prioritized, explained recommendations. DuckDB is not a SQL Server replacement — it is the cheap, embeddable OLAP engine where you *iterate analysis* against captured data with **zero further load on the source**, join across captures, and trend across runs over time.
 
-> **The model in one sentence:** capture read-only DMV/catalog data from SQL Server **once** → land it as CSV under `./capture/` → load it into DuckDB locally → run `00-load.sql`, then the `a01..a10` rule library, then `a99` for the consolidated prioritized report. Everything after the capture is offline.
+> **The model in one sentence:** capture read-only DMV/catalog data from SQL Server **once** → land it as CSV under `./capture/` → load it into DuckDB locally → run `00-load.sql`, then the `a01..a17` rule library, then `a99` for the consolidated prioritized report. Everything after the capture is offline.
 
 ---
 
@@ -64,6 +64,8 @@ capture/
   tables.csv           columns.csv         indexes.csv
   index_usage.csv      missing_indexes.csv index_physical.csv
   foreign_keys.csv     query_stats.csv     wait_stats.csv
+  db_files.csv         backup_history.csv  stats_health.csv
+  identity_columns.csv
 ```
 
 For **trending across multiple runs**, nest each run under `capture/<server>/<captured_at>/` (§6) so a glob can load and compare them.
@@ -72,81 +74,52 @@ For **trending across multiple runs**, nest each run under `capture/<server>/<ca
 
 ## 4. The Workflow: load → analyze → report
 
-The analysis library lives alongside this skill (conceptually under `analysis/`): `00-load.sql`, the rule files `a01-*.sql` … `a10-*.sql`, and the roll-up `a99-report.sql`.
+The analysis library lives alongside this skill under `analysis/`: `00-load.sql`, the rule files `a01-*.sql` … `a17-*.sql`, and the roll-up `a99-recommendations.sql`.
 
-### Step 1 — `00-load.sql`: create the 12 tables
+### Step 1 — `00-load.sql`: create the 16 tables
 
-`00-load.sql` points DuckDB at `./capture/` and creates one table per file with `read_csv_auto` (header + type inference on). One table per contract file:
-
-```sql
--- 00-load.sql  (run once per session; safe to re-run — it replaces the tables)
-CREATE OR REPLACE TABLE server_info     AS SELECT * FROM read_csv_auto('capture/server_info.csv');
-CREATE OR REPLACE TABLE config          AS SELECT * FROM read_csv_auto('capture/config.csv');
-CREATE OR REPLACE TABLE db_inventory    AS SELECT * FROM read_csv_auto('capture/db_inventory.csv');
-CREATE OR REPLACE TABLE tables          AS SELECT * FROM read_csv_auto('capture/tables.csv');
-CREATE OR REPLACE TABLE columns         AS SELECT * FROM read_csv_auto('capture/columns.csv');
-CREATE OR REPLACE TABLE indexes         AS SELECT * FROM read_csv_auto('capture/indexes.csv');
-CREATE OR REPLACE TABLE index_usage     AS SELECT * FROM read_csv_auto('capture/index_usage.csv');
-CREATE OR REPLACE TABLE missing_indexes AS SELECT * FROM read_csv_auto('capture/missing_indexes.csv');
-CREATE OR REPLACE TABLE index_physical  AS SELECT * FROM read_csv_auto('capture/index_physical.csv');
-CREATE OR REPLACE TABLE foreign_keys    AS SELECT * FROM read_csv_auto('capture/foreign_keys.csv');
-CREATE OR REPLACE TABLE query_stats      AS SELECT * FROM read_csv_auto('capture/query_stats.csv');
-CREATE OR REPLACE TABLE wait_stats       AS SELECT * FROM read_csv_auto('capture/wait_stats.csv');
-```
+`00-load.sql` points DuckDB at `./capture/` and creates one table per contract file with `read_csv_auto` — table name == file base name — plus the `fmt_n`/`fmt_d` formatting macros the rules use. Every non-text contract column's **type is pinned** in the load (`types={...}`), so a header-only stub or an all-NULL column can never mis-type a table and break a rule; timestamps must therefore be ISO-formatted (the capture guide's export path guarantees it). Run it once per session; it is safe to re-run (it replaces the tables).
 
 > `tables` and `columns` are reserved-ish words in some dialects; DuckDB accepts them as identifiers, but double-quote them (`"tables"`, `"columns"`) if a parser complains.
 
-### Step 2 — `a01..a10`: run the rule library
+### Step 2 — `a01..a17`: run the rule library
 
-Each rule file is a single `SELECT` that emits **exactly the unified findings shape** (see §5). They are pure reads — run any subset, or all of them. Each maps to one dimension (the full rule catalog with thresholds/caveats is in **`recommendation-rules.md`**; what each dimension means is in **`analysis-dimensions.md`**):
+Each rule file emits **exactly the unified findings shape** (see §5). They are pure reads — run any subset, or all of them. The file names are the rule groups (full catalog with thresholds/caveats in **`recommendation-rules.md`**; what each dimension means in **`analysis-dimensions.md`**):
 
 | File | Dimension | Primary captures it reads |
 |---|---|---|
-| `a01` | Table design | `tables`, `columns`, `indexes` |
-| `a02` | Indexing — unused/duplicate/overlapping | `indexes`, `index_usage` |
-| `a03` | Indexing — missing (consolidated) | `missing_indexes` |
-| `a04` | Indexing — fragmentation/page fullness | `index_physical` |
-| `a05` | Sizing & capacity | `tables`, `db_inventory` |
-| `a06` | Statistics | `db_inventory` (auto-stats flags), `tables` |
-| `a07` | Query hotspots | `query_stats` |
-| `a08` | Configuration | `config`, `server_info`, `db_inventory` |
-| `a09` | Configuration / waits context | `wait_stats`, `server_info` |
-| `a10` | Table design — foreign keys / heaps | `foreign_keys`, `tables`, `indexes` |
+| `a01-design-heaps-no-pk` | Table design | `tables`, `index_physical` |
+| `a02-design-clustered-keys` | Table design | `indexes`, `columns`, `tables` |
+| `a03-design-datatypes` | Table design | `columns`, `foreign_keys` |
+| `a04-index-unused` | Indexing | `index_usage`, `indexes`, `server_info` |
+| `a05-index-duplicate` | Indexing | `indexes` |
+| `a06-index-missing` | Indexing | `missing_indexes`, `index_usage` |
+| `a07-index-fragmentation` | Indexing | `index_physical` |
+| `a08-sizing` | Sizing & capacity | `tables` |
+| `a09-query-hotspots` | Query hotspots | `query_stats` |
+| `a10-config` | Configuration | `config`, `server_info` |
+| `a11-db-settings` | Statistics / Configuration | `db_inventory` |
+| `a12-design-fk-trust` | Table design | `foreign_keys`, `tables`, `indexes` |
+| `a13-storage-files` | Configuration / Sizing & capacity | `db_files`, `server_info` |
+| `a14-backup-recovery` | Configuration | `backup_history`, `db_inventory` |
+| `a15-statistics-health` | Statistics | `stats_health` |
+| `a16-identity-exhaustion` | Table design | `identity_columns` |
+| `a17-waits-context` | Configuration | `wait_stats`, `server_info` |
 
-(The exact file→rule mapping is the catalog's authority; the table above is the working layout.)
+### Step 3 — `a99-recommendations.sql`: the prioritized report
 
-### Step 3 — `a99-report.sql`: the prioritized report
-
-`a99` `UNION ALL`s every rule's findings (they all share the same column list) and orders them so **High** severity floats to the top, then by dimension:
-
-```sql
--- a99-report.sql  — consolidate every rule into one prioritized advisory report
-WITH findings AS (
-    SELECT * FROM (/* paste or :include a01 */) 
-    UNION ALL SELECT * FROM (/* a02 */)
-    UNION ALL SELECT * FROM (/* a03 */)
-    -- ... a04 .. a10 ...
-)
-SELECT
-    CASE severity WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END AS severity_rank,
-    dimension, database_name, object_name, severity,
-    metric, finding, recommendation, why, consult_skill
-FROM findings
-ORDER BY severity_rank, dimension, database_name, object_name;
-```
-
-In the CLI, you can keep each rule in its own file and assemble the report with `.read`:
+`a99` is **self-contained**: it re-issues every rule body into one `advisor_findings` temp view (each rule's logic appears exactly once), then emits RESULT 1 — every finding ordered **High → Medium → Low**, then dimension — and RESULT 2 — counts by dimension × severity from the *same view*, so the two can never disagree.
 
 ```
 duckdb advisor.duckdb
 D .read analysis/00-load.sql
-D .read analysis/a99-report.sql      -- a99 itself .reads / inlines a01..a10
+D .read analysis/a99-recommendations.sql   -- self-contained: inlines a01..a17
 ```
 
 Or run a single rule interactively to inspect just one dimension:
 
 ```
-D .read analysis/a07-query-hotspots.sql
+D .read analysis/a09-query-hotspots.sql
 ```
 
 The output is a ranked table of findings — each row tells the user **what is wrong (finding)**, **what to do (recommendation)**, **why it matters (why)**, the **evidence (metric)**, and **which sibling skill to consult for the remediation depth (consult_skill)**. Every recommendation is **advisory** — validate in non-prod before acting; see `recommendation-rules.md`.
@@ -155,7 +128,7 @@ The output is a ranked table of findings — each row tells the user **what is w
 
 ## 5. The Loaded Table Schema (the capture contract)
 
-These 12 tables are the contract — column names are load-bearing and shared by collectors and analysis. Every row carries `server_name` and `captured_at`; per-database tables also carry `database_name`. Key columns below; the full column list lives in `SKILL.md`.
+These 16 tables are the contract — column names are load-bearing and shared by collectors and analysis. Every row carries `server_name` and `captured_at`; per-database tables also carry `database_name`. Key columns below; the full column list lives in `SKILL.md`.
 
 1. **`server_info`** (one row) — `product_version`, `product_major_version`, `edition`, `engine_edition`, `host_cpu_count`, `host_physical_memory_mb`, `sql_memory_limit_mb`, `sqlserver_start_time`, `is_hadr_enabled`. *Establish version/edition/platform from here before any version-sensitive finding.*
 2. **`config`** (one row per setting) — `config_name`, `value_in_use`, `minimum`, `maximum`.
@@ -169,10 +142,14 @@ These 12 tables are the contract — column names are load-bearing and shared by
 10. **`foreign_keys`** (one row per FK) — `table_name`, `fk_name`, `referenced_schema`, `referenced_table`, `is_disabled`, `is_not_trusted`, `delete_referential_action_desc`, `update_referential_action_desc`, `parent_column_list`, `referenced_column_list`.
 11. **`query_stats`** (top ~50 plan-cache queries) — `query_hash`, `execution_count`, `total_worker_time_ms`, `avg_worker_time_ms`, `total_logical_reads`, `avg_logical_reads`, `total_elapsed_time_ms`, `avg_elapsed_time_ms`, `total_grant_kb`, `sample_query_text`.
 12. **`wait_stats`** (top waits, benign filtered) — `wait_type`, `waiting_tasks_count`, `wait_time_ms`, `signal_wait_time_ms`, `pct_of_total`.
+13. **`db_files`** (one row per database file, all DBs incl. tempdb) — `file_type_desc`, `logical_name`, `size_mb`, `max_size_mb` (NULL = unlimited), `is_percent_growth`, `growth_value` (% or MB; 0 = disabled), `vlf_count` (log files, 2016 SP2+).
+14. **`backup_history`** (one row per database, tempdb excluded) — `recovery_model_desc`, `last_full_backup` / `last_diff_backup` / `last_log_backup` (NULL = never; copy-only fulls excluded), `full_backup_count_30d`, `log_backup_count_7d`, `last_full_backup_size_mb`, `last_full_has_checksum`.
+15. **`stats_health`** (one row per statistics object on rowsets ≥ 1000 rows) — `stats_name`, `is_auto_created`, `no_recompute`, `last_updated`, `rows`, `rows_sampled`, `sample_pct`, `modification_counter`.
+16. **`identity_columns`** (one row per IDENTITY column or SEQUENCE) — `object_type`, `data_type`, `seed_value`, `increment_value`, `last_value`, `max_value`, `is_cycling`, `pct_used`.
 
 ### The unified findings shape
 
-Every rule (`a01..a10`) `SELECT`s **exactly** these columns so `a99` can `UNION ALL` them with no casting:
+Every rule (`a01..a17`) `SELECT`s **exactly** these columns so `a99` can `UNION ALL` them with no casting:
 
 | Column | Meaning |
 |---|---|
@@ -286,7 +263,7 @@ This is how you answer *"is this table growing 5% a week?"*, *"did fragmentation
 The library is meant to grow. To add a rule:
 
 1. **Create a new `aNN-<name>.sql`** (pick an unused `NN`). Make it a single `SELECT` that emits **exactly the unified findings shape** (§5) — same column names, same order, same `dimension` vocabulary and `severity` values. The columns are the contract; if your rule doesn't have a value for one (e.g. instance-level rule with no `database_name`), `SELECT NULL AS database_name`.
-2. **Read only the contract tables** (the 12 loaded by `00-load.sql`). Don't invent new captures unless you also extend the collectors and the contract.
+2. **Read only the contract tables** (the 16 loaded by `00-load.sql`). Don't invent new captures unless you also extend the collectors and the contract.
 3. **Use a clear `metric`** that shows the evidence (the numbers that triggered the rule) so a reviewer can sanity-check the threshold.
 4. **Set `consult_skill`** to the sibling skill that owns the *how* (engineering / operations / infrastructure / monitoring).
 5. **Register it in `a99`** — add one `UNION ALL SELECT * FROM (/* aNN */)` (or a `.read` include) so it appears in the consolidated report.

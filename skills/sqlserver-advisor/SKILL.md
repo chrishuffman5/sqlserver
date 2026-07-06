@@ -1,9 +1,9 @@
 ---
 name: sqlserver-advisor
-description: "Offline SQL Server analysis & recommendations engine: capture read-only system-view/DMV/catalog data from a target instance ONCE, land it as local CSV/Parquet, load it into DuckDB, and run an analysis query library that produces PRIORITIZED, EXPLAINED recommendations across table/schema design, indexing, table sizes & capacity, statistics, query hotspots, and configuration — the PerformanceMonitor 'Lite' pattern. Complements the live diagnostic skills; iterate analysis with zero further load on the source and trend across capture runs. WHEN: \"analyze my database\", \"recommendations to improve the database\", \"table design review\", \"what indexes am I missing\", \"unused/duplicate indexes\", \"is my schema well designed\", \"offline database analysis\", \"DuckDB SQL Server analysis\", \"database health report\", \"capacity review\", \"advisor\", \"prioritized findings\"."
+description: "Offline SQL Server analysis & recommendations engine: capture read-only system-view/DMV/catalog data from a target instance ONCE, land it as local CSV/Parquet, load it into DuckDB, and run an analysis query library that produces PRIORITIZED, EXPLAINED recommendations across table/schema design, indexing, table sizes & capacity, statistics staleness, query hotspots, waits, configuration, file/autogrowth/tempdb layout, backup & recovery cadence, and identity-exhaustion runway — the PerformanceMonitor 'Lite' pattern. Complements the live diagnostic skills; iterate analysis with zero further load on the source and trend across capture runs. WHEN: \"analyze my database\", \"recommendations to improve the database\", \"table design review\", \"what indexes am I missing\", \"unused/duplicate indexes\", \"is my schema well designed\", \"offline database analysis\", \"DuckDB SQL Server analysis\", \"database health report\", \"capacity review\", \"backup review\", \"identity running out\", \"advisor\", \"prioritized findings\"."
 license: MIT
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # SQL Server Advisor (Offline Analysis & Recommendations)
@@ -35,7 +35,7 @@ The advisor *finds and ranks*; the deeper skills *fix*. Every finding row carrie
         |
 3. LOAD        DuckDB reads ./capture/*.csv   (00-load.sql; table name == file base name)
         |
-4. ANALYZE     run the a*.sql library  ->  a99-recommendations = single prioritized report (UNION ALL of a01..a11)
+4. ANALYZE     run the a*.sql library  ->  a99-recommendations = single prioritized report (UNION ALL of a01..a17)
 ```
 
 ### Stage 1 — ESTABLISH (always first)
@@ -63,18 +63,18 @@ Why DuckDB: it is a single-file, zero-server analytics engine that reads CSV/Par
 
 ### Stage 4 — ANALYZE & RECOMMEND
 
-Run the analysis library `analysis/a01..a11.sql`. **Every analysis query SELECTs the same unified findings shape** (below), so `analysis/a99-recommendations.sql` is a single `UNION ALL` (of `a01`..`a11`) that produces the **prioritized health report**, ordered by `severity` then dimension. Read the `a99` output top-down: High first, each row already carries the evidence, the finding, the fix, the why, and the skill to consult for depth.
+Run the analysis library `analysis/a01..a17.sql`. **Every analysis query SELECTs the same unified findings shape** (below), so `analysis/a99-recommendations.sql` is a single `UNION ALL` (of `a01`..`a17`, single-sourced in one view) that produces the **prioritized health report**, ordered by `severity` then dimension. Read the `a99` output top-down: High first, each row already carries the evidence, the finding, the fix, the why, and the skill to consult for depth.
 
 The six **analysis dimensions**:
 
 | Dimension | Smells the advisor flags (examples) | Owns the fix |
 |---|---|---|
-| **Table design** | Heaps with scans, no primary key, GUID clustered keys, over-wide rows, no compression on big tables, untrusted/disabled FKs | `sqlserver-engineering` |
-| **Indexing** | High-impact missing indexes, unused/rarely-used wide indexes, exact-duplicate/overlapping indexes, disabled indexes | `sqlserver-engineering` |
-| **Sizing & capacity** | Largest tables/indexes, high unused space, big heaps, partition skew, growth vs. baseline across captures | `sqlserver-operations` |
-| **Statistics** | Auto-update / auto-create statistics off, synchronous auto-update on a large DB (latency risk) | `sqlserver-operations` |
+| **Table design** | Heaps with scans, no primary key, GUID clustered keys, over-wide rows, untrusted/disabled/unindexed FKs, identity/sequence range nearly exhausted | `sqlserver-engineering` |
+| **Indexing** | High-impact missing indexes, unused/rarely-used wide indexes, exact-duplicate/overlapping indexes, disabled indexes, fragmentation | `sqlserver-engineering` |
+| **Sizing & capacity** | Largest tables/indexes, high unused space, no compression on big tables, files at/near MAXSIZE caps, autogrowth disabled, growth vs. baseline across captures | `sqlserver-operations` |
+| **Statistics** | Auto-update / auto-create statistics off, per-statistic staleness vs. the auto-update threshold, poor sampling, NORECOMPUTE | `sqlserver-operations` |
 | **Query hotspots** | Top plan-cache queries by CPU / logical reads / memory grant; high avg cost per execution | `sqlserver-monitoring` → `sqlserver-engineering` |
-| **Configuration** | MAXDOP/cost-threshold defaults, RCSI off, page-verify ≠ CHECKSUM, full recovery without log mgmt, old compat level, benign-filtered top waits | `sqlserver-infrastructure` / `sqlserver-operations` |
+| **Configuration** | MAXDOP/cost-threshold/max-memory defaults, legacy knobs, RCSI off, page-verify ≠ CHECKSUM, backup cadence gaps (no/stale fulls, FULL recovery without log backups, blocked log reuse), percent/tiny autogrowth, VLF bloat, tempdb file layout, dominant waits & signal-wait ratio | `sqlserver-infrastructure` / `sqlserver-operations` |
 
 ## PINNED CAPTURE CONTRACT (single source of truth)
 
@@ -92,10 +92,14 @@ The collectors and the DuckDB analysis share these schemas **exactly** — colum
 10. **`foreign_keys`** [per-DB] (one row per FK) — `server_name, captured_at, database_name, schema_name, table_name, fk_name, referenced_schema, referenced_table, is_disabled, is_not_trusted, delete_referential_action_desc, update_referential_action_desc, parent_column_list, referenced_column_list`
 11. **`query_stats`** (top ~50 plan-cache queries) — `server_name, captured_at, database_name, query_hash, execution_count, total_worker_time_ms, avg_worker_time_ms, total_logical_reads, avg_logical_reads, total_elapsed_time_ms, avg_elapsed_time_ms, total_grant_kb, sample_query_text`
 12. **`wait_stats`** (top waits, benign filtered) — `server_name, captured_at, wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms, pct_of_total`
+13. **`db_files`** (one row per database file, ALL DBs incl. tempdb) — `server_name, captured_at, database_name, database_id, file_id, file_type_desc, logical_name, physical_name, state_desc, size_mb, max_size_mb, is_percent_growth, growth_value, vlf_count` — `max_size_mb` NULL = unlimited; `growth_value` is % when `is_percent_growth`, else MB (0 = growth disabled); `vlf_count` only for online DBs' logs (2016 SP2+)
+14. **`backup_history`** (one row per database, tempdb excluded; NULL dates = never) — `server_name, captured_at, database_name, recovery_model_desc, last_full_backup, last_diff_backup, last_log_backup, full_backup_count_30d, log_backup_count_7d, last_full_backup_size_mb, last_full_has_checksum` — COPY_ONLY fulls excluded from `last_full_backup`/counts
+15. **`stats_health`** [per-DB, rowsets ≥ 1000 rows] (one row per statistics object) — `server_name, captured_at, database_name, schema_name, table_name, stats_name, stats_id, is_auto_created, is_user_created, no_recompute, has_filter, last_updated, rows, rows_sampled, sample_pct, modification_counter`
+16. **`identity_columns`** [per-DB] (one row per IDENTITY column or SEQUENCE) — `server_name, captured_at, database_name, object_type, schema_name, table_name, column_name, data_type, seed_value, increment_value, last_value, max_value, is_cycling, pct_used` — `object_type` ∈ {`IDENTITY`,`SEQUENCE`}; `pct_used` NULL for descending/never-used
 
 ## UNIFIED FINDINGS SHAPE
 
-Every analysis query (`a01`..`a10`) returns **exactly** these columns so `a99` can `UNION ALL` them into one report:
+Every analysis query (`a01`..`a17`) returns **exactly** these columns so `a99` can `UNION ALL` them into one report:
 
 | Column | Meaning |
 |---|---|
@@ -131,8 +135,12 @@ Every analysis query (`a01`..`a10`) returns **exactly** these columns so `a99` c
 - `10-foreign-keys.sql` → `foreign_keys` — [per-DB] FK definitions with trust/disabled/cascade actions and column lists.
 - `11-query-stats.sql` → `query_stats` — instance: top ~50 plan-cache queries by cost (CPU/reads/elapsed/grant) with sample text.
 - `12-wait-stats.sql` → `wait_stats` — instance: top waits with the benign-wait filter and `pct_of_total`.
+- `13-db-files.sql` → `db_files` — instance: every database file (incl. tempdb) with size, growth settings, MAXSIZE cap, VLF count (2016 SP2+; not on Azure SQL DB — see the collector header for the per-DB fallback).
+- `14-backup-history.sql` → `backup_history` — instance: last full/diff/log backup + recent counts per database from msdb (needs msdb read access; N/A on Azure SQL DB — platform-managed).
+- `15-stats-health.sql` → `stats_health` — [per-DB] per-statistic freshness/sampling/churn from `sys.dm_db_stats_properties` (rowsets ≥ 1000 rows).
+- `16-identity-columns.sql` → `identity_columns` — [per-DB] IDENTITY columns and SEQUENCEs with range-consumption percentage.
 
-(03 is instance-level inventory; 04–10 are per-DB and run once per online user database; 01–02, 11–12 are instance-level and run once.)
+(03 is instance-level inventory; 04–10 and 15–16 are per-DB and run once per online user database; 01–02, 11–14 are instance-level and run once.)
 
 ### `analysis/` (DuckDB load + analysis library — run `00-load.sql` first, then any `a*`, then `a99`)
 - `00-load.sql` — create one DuckDB relation per `capture/*.csv` (table name == file base name); defines the `fmt_n`/`fmt_d` formatting macros; optional Parquet stacking for multi-run trends.
@@ -145,14 +153,20 @@ Every analysis query (`a01`..`a10`) returns **exactly** these columns so `a99` c
 - `a07-index-fragmentation.sql` — Indexing: logical fragmentation (10–30% → REORGANIZE, >30% → REBUILD), `page_count >= 1000`.
 - `a08-sizing.sql` — Sizing & capacity: largest tables, allocated-but-unused space, uncompressed big tables, partitioning & over-indexed candidates.
 - `a09-query-hotspots.sql` — Query hotspots: top plan-cache queries by total CPU and logical reads, plus expensive-and-frequent.
-- `a10-config.sql` — Configuration (instance): cost threshold = 5, MAXDOP = 0 on a multi-core host, optimize-for-ad-hoc off, backup compression off.
+- `a10-config.sql` — Configuration (instance): cost threshold = 5, MAXDOP = 0 on a multi-core host, optimize-for-ad-hoc off, backup compression off, max server memory uncapped (box), priority boost / lightweight pooling enabled.
 - `a11-db-settings.sql` — Statistics + Configuration (per database): auto-update/auto-create stats off, sync auto-update on large DBs, PAGE_VERIFY ≠ CHECKSUM, RCSI off, old compatibility level.
-- `a99-recommendations.sql` — self-contained `UNION ALL` of `a01`..`a11` → RESULT 1 the prioritized report (High → Low), RESULT 2 counts by dimension × severity.
+- `a12-design-fk-trust.sql` — Table design: untrusted (NOCHECK) FKs, disabled FKs, cascades on large children, FK columns with no supporting index.
+- `a13-storage-files.sql` — Configuration + Sizing & capacity: percent/tiny/disabled autogrowth, files near MAXSIZE, high VLF counts, tempdb data-file count vs. CPUs.
+- `a14-backup-recovery.sql` — Configuration: never/stale full backups, FULL recovery without log backups, blocked log reuse, SIMPLE recovery on sizable DBs, backups without CHECKSUM.
+- `a15-statistics-health.sql` — Statistics (per statistic): churn past the auto-update threshold, 90-day-old stats with churn, sub-5% sampling on big tables, NORECOMPUTE.
+- `a16-identity-exhaustion.sql` — Table design: IDENTITY/SEQUENCE range consumption ≥ 50% (High ≥ 90%).
+- `a17-waits-context.sql` — Configuration: dominant wait type (≥ 25% of filtered waits, routed per class), high signal-wait ratio (CPU pressure).
+- `a99-recommendations.sql` — self-contained: all rules `a01`..`a17` in ONE view (single-sourced) → RESULT 1 the prioritized report (High → Low), RESULT 2 counts by dimension × severity.
 
 ### `references/`
 - `capture-guide.md` — how to run Stage 2: the PowerShell/`Invoke-Sqlcmd` path with robust quoting, the per-DB loop over user databases, `sqlcmd`/`bcp`/Parquet alternatives, least-impact guidance (SAMPLED/LIMITED off-peak), per-platform notes (Azure SQL DB/MI, AWS RDS, Cloud SQL), the `captured_at`/`server_name` trending columns, the read-only permission set, and the **AUTO_CLOSE / restart caveat** (usage & missing-index DMVs reset, so they read empty on AUTO_CLOSE databases — common on Express — and after a restart).
 - `duckdb-analysis.md` — getting DuckDB, the local-store model, the load → analyze → report workflow, the loaded-table schema, trending across runs (dated Parquet), and how to extend with custom rules.
-- `recommendation-rules.md` — the rule catalog (a01..a11): detection logic, thresholds, severity, recommendation, rationale, and the caveats for each rule (advisory; validate in non-prod).
+- `recommendation-rules.md` — the rule catalog (a01..a17): detection logic, thresholds, severity, recommendation, rationale, and the caveats for each rule (advisory; validate in non-prod).
 - `analysis-dimensions.md` — what "good" looks like per dimension (Table design / Indexing / Sizing & capacity / Statistics / Query hotspots / Configuration), the feeding captures, and the sibling skill that owns each fix.
 
 ## Cross-Skill Routing
